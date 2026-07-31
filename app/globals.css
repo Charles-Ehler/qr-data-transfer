@@ -566,6 +566,10 @@ input:focus-visible {
   cursor: default;
 }
 
+.qr-stage.playing .fullscreen-button {
+  display: none;
+}
+
 .qr-stage:fullscreen {
   width: 100vw;
   height: 100vh;

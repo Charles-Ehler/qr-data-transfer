@@ -1,18 +1,59 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import test from "node:test";
-import QRCode from "qrcode";
-import jsQR from "jsqr";
+import { initSync as initRaptorQ } from "@raptorqr/raptorq-wasm";
+import { RaptorQWasmDecoder } from "@raptorqr/core/fec/raptorq_wasm";
+import { encodeQRCodeMatrix } from "@raptorqr/core/qr/qr_encoder_node";
+import {
+  prepareZXingModule,
+  readBarcodes,
+  type ReaderOptions,
+} from "zxing-wasm/reader";
 import { compressForTransfer, decompressTransfer } from "../lib/compression";
 import {
+  buildOpticalContainer,
+  createOpticalTransfer,
   crc32,
-  createDroplet,
-  createTransferSource,
-  decodeTransferFrame,
-  encodeDescriptor,
-  encodeDroplet,
-  FountainDecoder,
-} from "../lib/qr-transfer";
+  OPTICAL_FRAME_OVERHEAD,
+  parseOpticalContainer,
+  parseOpticalFrame,
+  raptorPacketKey,
+} from "../lib/optical-transfer";
 import { TRANSFER_PRESETS } from "../lib/transfer-presets";
+
+const require = createRequire(import.meta.url);
+let raptorQReady = false;
+let zxingReady: Promise<unknown> | undefined;
+
+function prepareRaptorQ() {
+  if (raptorQReady) return;
+  initRaptorQ({
+    module: readFileSync(
+      require.resolve(
+        "@raptorqr/raptorq-wasm/wasm/raptorqr_raptorq_wasm_bg.wasm",
+      ),
+    ),
+  });
+  raptorQReady = true;
+}
+
+function prepareZXing() {
+  if (!zxingReady) {
+    zxingReady = Promise.resolve(
+      prepareZXingModule({
+        overrides: {
+          wasmBinary: readFileSync(
+            require.resolve("zxing-wasm/reader/zxing_reader.wasm"),
+          ),
+        },
+        equalityFn: Object.is,
+        fireImmediately: true,
+      }),
+    );
+  }
+  return zxingReady;
+}
 
 function deterministicBytes(length: number) {
   const output = new Uint8Array(length);
@@ -35,151 +76,136 @@ function seededRandom(seed: number) {
   };
 }
 
-const fixedSession = new Uint8Array([1, 2, 3, 4, 5, 6]);
+class TestImageData {
+  readonly colorSpace = "srgb";
 
-test("compact descriptor and data frames round-trip independently", () => {
-  const bytes = deterministicBytes(4097);
-  const source = createTransferSource(bytes, {
-    filename: "camera-notes.txt",
-    mime: "text/plain",
-    blockSize: 300,
-    sessionBytes: fixedSession,
-  });
-  const descriptor = decodeTransferFrame(encodeDescriptor(source));
-  assert.equal(descriptor.kind, "descriptor");
-  assert.equal(descriptor.kind === "descriptor" && descriptor.meta.filename, "camera-notes.txt");
+  constructor(
+    readonly data: Uint8ClampedArray,
+    readonly width: number,
+    readonly height: number,
+  ) {}
+}
 
-  const original = createDroplet(source, 17);
-  const data = decodeTransferFrame(encodeDroplet(original));
-  assert.equal(data.kind, "data");
-  assert.equal(data.kind === "data" && data.sequence, original.sequence);
-  assert.deepEqual(data.kind === "data" && data.payload, original.payload);
-  assert.ok(
-    encodeDroplet(original).length < 520,
-    "compact payload frame should not repeat filename and MIME metadata",
+test("file container preserves metadata, compression, and both checksums", async () => {
+  const original = new TextEncoder().encode(
+    "camera-transfer,raptorq,raw-binary\n".repeat(12_000),
   );
-});
-
-test("damaged frames are rejected by the per-frame checksum", () => {
-  const source = createTransferSource(deterministicBytes(2048), {
-    filename: "integrity.bin",
-    blockSize: 300,
-    sessionBytes: new Uint8Array(6).fill(9),
-  });
-  const valid = encodeDroplet(createDroplet(source, 1));
-  const pivot = Math.floor(valid.length * 0.7);
-  const damaged =
-    valid.slice(0, pivot) +
-    (valid[pivot] === "A" ? "B" : "A") +
-    valid.slice(pivot + 1);
-  assert.throws(() => decodeTransferFrame(damaged), /checksum|Base45|Invalid/i);
-});
-
-test("level-9 compression is used only when it saves optical payload", async () => {
-  const text = new TextEncoder().encode("camera transfer telemetry,".repeat(8000));
-  const compressed = await compressForTransfer(text);
-  assert.equal(compressed.mode, "gzip");
-  assert.ok(compressed.bytes.length < text.length * 0.02);
-  assert.deepEqual(await decompressTransfer(compressed.bytes, compressed.mode), text);
-
-  const random = deterministicBytes(16 * 1024);
-  const incompressible = await compressForTransfer(random);
-  assert.equal(incompressible.mode, "none");
-  assert.deepEqual(incompressible.bytes, random);
-});
-
-test("fountain repair recovers through drop, reorder, duplicate, and corruption loss", () => {
-  const bytes = deterministicBytes(96 * 1024 + 17);
-  const source = createTransferSource(bytes, {
-    filename: "field-recording.raw",
-    mime: "application/octet-stream",
-    blockSize: 300,
-    sessionBytes: new Uint8Array([11, 22, 33, 44, 55, 66]),
-  });
-  const random = seededRandom(0xdecafbad);
-  const candidates: string[] = [];
-  const maximumSequence = source.meta.blockCount * 7;
-
-  for (let sequence = 0; sequence < maximumSequence; sequence += 1) {
-    if (random() < 0.42) continue;
-    const frame = encodeDroplet(createDroplet(source, sequence));
-    if (random() < 0.08) continue;
-    candidates.push(frame);
-    if (random() < 0.06) candidates.push(frame);
-  }
-  for (let index = candidates.length - 1; index > 0; index -= 1) {
-    const swap = Math.floor(random() * (index + 1));
-    [candidates[index], candidates[swap]] = [candidates[swap], candidates[index]];
-  }
-
-  const descriptor = decodeTransferFrame(encodeDescriptor(source));
-  assert.equal(descriptor.kind, "descriptor");
-  const decoder = new FountainDecoder();
-  if (descriptor.kind === "descriptor") decoder.initialize(descriptor.meta);
-  for (const encoded of candidates) {
-    const frame = decodeTransferFrame(encoded);
-    if (frame.kind === "data") decoder.receiveData(frame);
-    if (decoder.isComplete) break;
-  }
-  assert.equal(
-    decoder.isComplete,
-    true,
-    `only recovered ${decoder.solvedCount}/${decoder.totalCount} blocks`,
-  );
-  assert.deepEqual(decoder.result(), bytes);
-});
-
-test("compressed files verify both transmitted and original checksums", async () => {
-  const original = new TextEncoder().encode("air-gapped-data\n".repeat(12000));
   const compressed = await compressForTransfer(original);
-  const source = createTransferSource(compressed.bytes, {
-    filename: "records.csv",
+  assert.notEqual(compressed.mode, "none");
+  const prepared = buildOpticalContainer(original, compressed.bytes, {
+    filename: "research-notes.csv",
     mime: "text/csv",
-    blockSize: 280,
-    sessionBytes: new Uint8Array([9, 8, 7, 6, 5, 4]),
-    originalSize: original.length,
-    originalCrc: crc32(original),
     compression: compressed.mode,
   });
-  const descriptor = decodeTransferFrame(encodeDescriptor(source));
-  assert.equal(descriptor.kind, "descriptor");
-  const decoder = new FountainDecoder();
-  if (descriptor.kind === "descriptor") decoder.initialize(descriptor.meta);
-  for (let sequence = 0; sequence < source.meta.blockCount; sequence += 1) {
-    const frame = decodeTransferFrame(encodeDroplet(createDroplet(source, sequence)));
-    if (frame.kind === "data") decoder.receiveData(frame);
-  }
-  const recovered = await decompressTransfer(decoder.result(), source.meta.compression);
-  assert.equal(crc32(recovered), source.meta.fileCrc);
+  const parsed = parseOpticalContainer(prepared.container);
+  const recovered = await decompressTransfer(
+    parsed.transmitted,
+    parsed.meta.compression,
+  );
+
+  assert.equal(parsed.meta.filename, "research-notes.csv");
+  assert.equal(parsed.meta.mime, "text/csv");
+  assert.equal(parsed.meta.fileSize, original.length);
+  assert.equal(crc32(recovered), parsed.meta.fileCrc);
   assert.deepEqual(recovered, original);
 });
 
-test("the actual QR encoder and camera decoder preserve a compact payload frame", () => {
-  const source = createTransferSource(deterministicBytes(4096), {
-    filename: "qr-pipeline.bin",
-    blockSize: 360,
-    sessionBytes: new Uint8Array([3, 1, 4, 1, 5, 9]),
+test("raw binary optical frames round-trip and reject corruption", async () => {
+  prepareRaptorQ();
+  const original = deterministicBytes(12_345);
+  const prepared = buildOpticalContainer(original, original, {
+    filename: "frame.bin",
+    compression: "none",
   });
-  const text = encodeDroplet(createDroplet(source, 3));
-  const qr = QRCode.create(text, { errorCorrectionLevel: "M" });
-  const margin = 4;
+  const preset = TRANSFER_PRESETS.balanced;
+  const transfer = await createOpticalTransfer(prepared, {
+    symbolSize: preset.symbolSize,
+    repairPercent: preset.repairPercent,
+  });
+  const frame = parseOpticalFrame(transfer.packets[0]);
+
+  assert.equal(frame.session, transfer.session);
+  assert.equal(frame.containerLength, prepared.container.length);
+  assert.equal(frame.symbolSize, preset.symbolSize);
+  assert.equal(
+    transfer.packets[0].length,
+    preset.symbolSize + OPTICAL_FRAME_OVERHEAD,
+  );
+
+  const damaged = transfer.packets[0].slice();
+  damaged[Math.floor(damaged.length * 0.7)] ^= 0x40;
+  assert.throws(() => parseOpticalFrame(damaged), /checksum/i);
+});
+
+test("RaptorQ reconstructs after unordered camera-frame erasures", async () => {
+  prepareRaptorQ();
+  const original = deterministicBytes(256 * 1024 + 37);
+  const prepared = buildOpticalContainer(original, original, {
+    filename: "loss-test.bin",
+    mime: "application/octet-stream",
+    compression: "none",
+  });
+  const preset = TRANSFER_PRESETS.turbo;
+  const transfer = await createOpticalTransfer(prepared, {
+    symbolSize: preset.symbolSize,
+    repairPercent: preset.repairPercent,
+  });
+  const random = seededRandom(0xdecafbad);
+  const received = transfer.packets
+    .filter(() => random() >= 0.12)
+    .sort(() => random() - 0.5);
+  const decoder = await RaptorQWasmDecoder.create(
+    transfer.containerLength,
+    transfer.symbolSize,
+  );
+  const seen = new Set<string>();
+  let decoded: Uint8Array | null = null;
+
+  for (const encoded of received) {
+    const frame = parseOpticalFrame(encoded);
+    const key = raptorPacketKey(frame);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    decoded = decoder.push(frame.payload);
+    if (decoded) break;
+  }
+
+  assert.ok(
+    decoded,
+    `RaptorQ did not recover from ${transfer.packets.length - received.length} erased frames`,
+  );
+  assert.equal(crc32(decoded), transfer.session);
+  const recovered = parseOpticalContainer(decoded);
+  assert.deepEqual(recovered.transmitted, original);
+});
+
+test("the actual Turbo QR renderer and ZXing scanner preserve raw bytes", async () => {
+  await prepareZXing();
+  const preset = TRANSFER_PRESETS.turbo;
+  const packet = deterministicBytes(preset.qrCapacity);
+  const matrix = await encodeQRCodeMatrix(
+    packet,
+    preset.version,
+    preset.ecc,
+  );
+  const quietZone = 4;
   const scale = 5;
-  const width = (qr.modules.size + margin * 2) * scale;
+  const width = (matrix.length + quietZone * 2) * scale;
   const rgba = new Uint8ClampedArray(width * width * 4);
   const random = seededRandom(12345);
 
   for (let y = 0; y < width; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const moduleX = Math.floor(x / scale) - margin;
-      const moduleY = Math.floor(y / scale) - margin;
+      const moduleX = Math.floor(x / scale) - quietZone;
+      const moduleY = Math.floor(y / scale) - quietZone;
       const dark =
         moduleX >= 0 &&
         moduleY >= 0 &&
-        moduleX < qr.modules.size &&
-        moduleY < qr.modules.size &&
-        qr.modules.get(moduleY, moduleX);
-      const cameraNoise = Math.floor(random() * 23);
-      const value = dark ? cameraNoise : 255 - cameraNoise;
+        moduleX < matrix.length &&
+        moduleY < matrix.length &&
+        matrix[moduleY][moduleX];
+      const noise = Math.floor(random() * 25);
+      const value = dark ? noise : 255 - noise;
       const offset = (y * width + x) * 4;
       rgba[offset] = value;
       rgba[offset + 1] = value;
@@ -188,100 +214,37 @@ test("the actual QR encoder and camera decoder preserve a compact payload frame"
     }
   }
 
-  const scanned = jsQR(rgba, width, width, { inversionAttempts: "dontInvert" });
-  assert.ok(scanned, "jsQR should decode the rasterized camera frame");
-  assert.equal(scanned.data, text);
-  const decoded = decodeTransferFrame(scanned.data);
-  assert.equal(decoded.kind === "data" && decoded.sequence, 3);
+  const options: ReaderOptions = {
+    formats: ["QRCode"],
+    tryHarder: true,
+    tryRotate: false,
+    tryInvert: false,
+    maxNumberOfSymbols: 1,
+  };
+  const results = await readBarcodes(
+    new TestImageData(rgba, width, width) as unknown as ImageData,
+    options,
+  );
+  assert.equal(results.length, 1);
+  assert.deepEqual(new Uint8Array(results[0].bytes), packet);
 });
 
-test("software fallback decodes four spatially multiplexed QR lanes", () => {
-  const preset = TRANSFER_PRESETS.turbo;
-  const source = createTransferSource(deterministicBytes(preset.blockSize * 8), {
-    filename: "four-lanes.bin",
-    blockSize: preset.blockSize,
-    sessionBytes: new Uint8Array([4, 3, 2, 1, 0, 9]),
-  });
-  const cellSize = 400;
-  const compositeSize = cellSize * 2;
-  const composite = new Uint8ClampedArray(compositeSize * compositeSize * 4).fill(255);
-
-  for (let lane = 0; lane < 4; lane += 1) {
-    const encoded = encodeDroplet(createDroplet(source, lane));
-    const qr = QRCode.create(encoded, { errorCorrectionLevel: preset.ecc });
-    const margin = 4;
-    const scale = Math.floor(cellSize / (qr.modules.size + margin * 2));
-    const renderedSize = (qr.modules.size + margin * 2) * scale;
-    const inset = Math.floor((cellSize - renderedSize) / 2);
-    const cellX = (lane % 2) * cellSize;
-    const cellY = Math.floor(lane / 2) * cellSize;
-    for (let y = 0; y < renderedSize; y += 1) {
-      for (let x = 0; x < renderedSize; x += 1) {
-        const moduleX = Math.floor(x / scale) - margin;
-        const moduleY = Math.floor(y / scale) - margin;
-        const dark =
-          moduleX >= 0 &&
-          moduleY >= 0 &&
-          moduleX < qr.modules.size &&
-          moduleY < qr.modules.size &&
-          qr.modules.get(moduleY, moduleX);
-        const output =
-          ((cellY + inset + y) * compositeSize + cellX + inset + x) * 4;
-        const value = dark ? 0 : 255;
-        composite[output] = value;
-        composite[output + 1] = value;
-        composite[output + 2] = value;
-        composite[output + 3] = 255;
-      }
-    }
-  }
-
-  const sequences = new Set<number>();
-  for (let row = 0; row < 2; row += 1) {
-    for (let column = 0; column < 2; column += 1) {
-      const quadrant = new Uint8ClampedArray(cellSize * cellSize * 4);
-      for (let y = 0; y < cellSize; y += 1) {
-        const inputStart =
-          ((row * cellSize + y) * compositeSize + column * cellSize) * 4;
-        quadrant.set(
-          composite.subarray(inputStart, inputStart + cellSize * 4),
-          y * cellSize * 4,
-        );
-      }
-      const scanned = jsQR(quadrant, cellSize, cellSize, {
-        inversionAttempts: "dontInvert",
-      });
-      assert.ok(scanned, `lane ${row * 2 + column + 1} should decode`);
-      const frame = decodeTransferFrame(scanned.data);
-      if (frame.kind === "data") sequences.add(frame.sequence);
-    }
-  }
-  assert.deepEqual(Array.from(sequences).sort((a, b) => a - b), [0, 1, 2, 3]);
-});
-
-test("all lane payloads stay within camera-friendly QR density", () => {
-  const maximumVersions = { robust: 17, balanced: 20, turbo: 14 };
-  for (const [name, preset] of Object.entries(TRANSFER_PRESETS)) {
-    const source = createTransferSource(deterministicBytes(preset.blockSize * 2), {
-      filename:
-        "an-extremely-long-desktop-filename-that-must-keep-its-important-extension.pptx",
-      mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      blockSize: preset.blockSize,
-      sessionBytes: new Uint8Array(6).fill(7),
-    });
-    const encoded = encodeDroplet(createDroplet(source, 0));
-    const qr = QRCode.create(encoded, { errorCorrectionLevel: preset.ecc });
-    const version = (qr.modules.size - 17) / 4;
-    assert.ok(
-      version <= maximumVersions[name as keyof typeof maximumVersions],
-      `${name} produced QR version ${version}`,
+test("all profiles fit exactly and Turbo increases the single-target channel", () => {
+  for (const preset of Object.values(TRANSFER_PRESETS)) {
+    assert.equal(
+      preset.symbolSize + OPTICAL_FRAME_OVERHEAD,
+      preset.qrCapacity,
     );
+    assert.ok(preset.usefulBytesPerFrame > 0);
   }
-  const turbo = TRANSFER_PRESETS.turbo;
-  const robust = TRANSFER_PRESETS.robust;
+  assert.equal(TRANSFER_PRESETS.turbo.version, 30);
+  assert.equal(TRANSFER_PRESETS.turbo.fps, 15);
   assert.ok(
-    turbo.blockSize * turbo.fps * turbo.lanes >
-      robust.blockSize * robust.fps * robust.lanes * 10,
-    "spatial multiplexing should provide more than 10x nominal robust capacity",
+    TRANSFER_PRESETS.turbo.usefulBytesPerFrame *
+      TRANSFER_PRESETS.turbo.fps >
+      TRANSFER_PRESETS.robust.usefulBytesPerFrame *
+        TRANSFER_PRESETS.robust.fps *
+        5,
+    "Turbo should offer more than 5x the nominal useful rate of Robust",
   );
 });

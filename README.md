@@ -9,32 +9,32 @@ to an application server.
 1. Open the root page on the sending screen and choose a file.
 2. Open `/scan` on the receiving phone and allow rear-camera access.
 3. Start the QR stream and keep the complete code inside the phone's guide.
-4. Save the file when recovery and the whole-file checksum reach 100%.
+4. Save the file when RaptorQ recovery and the whole-file checksum reach 100%.
 
-Robust mode uses one strongly corrected symbol. Balanced raises single-symbol
-density. Turbo spatially multiplexes four independent QR symbols per camera
-exposure, targeting roughly 15 KB/s before camera loss and compression gains.
+All modes now use one stable QR target. Robust uses larger modules, Balanced
+raises density, and Turbo sends a V30-L byte-mode symbol at 15 display frames
+per second. Turbo's nominal payload channel is about 25 KB/s before camera loss
+and can be substantially faster in effective file bytes when compression helps.
 
-## Resilience model
+## Protocol
 
-- Each QR uses native QR error correction to survive local image damage.
-- Level-9 DEFLATE is attempted before encoding and used only when the result is
-  smaller. The receiver verifies both the compressed stream and original file.
-- A Base45 wire envelope keeps frames in QR's compact alphanumeric mode.
-- Compact payload frames omit filenames and MIME data. A small, strongly
-  corrected descriptor beacon repeats periodically instead.
-- Turbo mode uses four spatial lanes. Software fallback scans each quadrant;
-  supported phones use the native multi-barcode detector.
-- Each binary frame has a CRC-32 checksum; corrupt frames are discarded.
-- The stream begins with systematic source blocks for fast clean transfers.
-- It then emits an unlimited robust-soliton fountain stream. Any sufficient set
-  of repair frames can reconstruct missed blocks, regardless of order.
-- The receiver deduplicates frames, incrementally peels fountain equations, and
-  verifies a second CRC-32 over the complete recovered file.
-
-Frame metadata is self-describing and repeated, so the receiver can join after
-the animation has already started. The current browser build accepts files up to
-512 MB.
+- Brotli quality 11 and gzip level 9 are both attempted; only the smallest
+  representation is retained, and only when it saves optical bytes.
+- QR frames use raw byte mode, avoiding the Base45 expansion of the previous
+  protocol.
+- Every frame carries a compact binary header, a RaptorQ symbol, and CRC-32.
+- File metadata is inside the protected RaptorQ object instead of repeating in
+  descriptor beacons.
+- Source and repair symbols are interleaved. The receiver can join mid-cycle,
+  discard blur, accept frames out of order, and reconstruct after receiving
+  enough unique symbols.
+- Turbo uses one V30-L code at 15 fps. A stable finder geometry is more reliable
+  than asking the camera to acquire four independent codes per exposure.
+- Rendering uses `fast_qr` compiled to WebAssembly. Scanning uses ZXing-C++
+  compiled to WebAssembly. Fountain encoding and decoding use the RFC 6330
+  RaptorQ implementation compiled to WebAssembly.
+- The receiver verifies the per-frame CRC, the complete RaptorQ object CRC, the
+  transmitted compressed payload CRC, and the original file CRC before saving.
 
 ## Development
 
@@ -56,12 +56,12 @@ npm test
 
 The harness checks:
 
-- packet and metadata round trips;
+- metadata, compression, and end-to-end checksum round trips;
 - per-frame corruption rejection;
-- complete recovery with 42% simulated camera-frame loss plus reordering,
-  duplicates, and additional corrupt-frame loss;
-- an actual `qrcode` raster passed through the same `jsQR` decoder used by the
-  mobile scanner;
+- RaptorQ reconstruction after unordered simulated camera-frame erasures;
+- the actual V30-L WebAssembly renderer passed through the actual ZXing-C++
+  WebAssembly scanner with exposure noise;
+- exact QR capacity for every profile;
 - production builds and server rendering for both `/` and `/scan`.
 
 Run `npm run lint` and `npx tsc --noEmit` for the additional source checks.

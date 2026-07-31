@@ -15,20 +15,22 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@raptorqr/core": "0.1.1",
+    "@raptorqr/fast-qr-wasm": "0.1.1",
+    "@raptorqr/raptorq-wasm": "0.1.1",
+    "brotli-wasm": "3.0.1",
     "drizzle-orm": "0.45.2",
     "fflate": "^0.8.3",
-    "jsqr": "^1.4.0",
     "next": "16.2.6",
-    "qrcode": "^1.5.4",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "zxing-wasm": "3.1.2"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
     "@cloudflare/workers-types": "^4.20260702.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
-    "@types/qrcode": "^1.5.6",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",

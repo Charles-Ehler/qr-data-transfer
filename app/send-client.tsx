@@ -1,6 +1,5 @@
 "use client";
 
-import QRCode from "qrcode";
 import {
   ChangeEvent,
   DragEvent,
@@ -10,18 +9,16 @@ import {
   useRef,
   useState,
 } from "react";
-import { compressForTransfer, CompressionMode } from "@/lib/compression";
+import { compressForTransfer } from "@/lib/compression";
 import {
-  crc32,
-  createDroplet,
-  createTransferSource,
-  encodeDescriptor,
-  encodeDroplet,
+  buildOpticalContainer,
+  createOpticalTransfer,
   formatBytes,
   formatRate,
   MAX_FILE_BYTES,
-  TransferSource,
-} from "@/lib/qr-transfer";
+  OpticalTransfer,
+  PreparedOpticalFile,
+} from "@/lib/optical-transfer";
 import {
   TRANSFER_PRESETS,
   TransferPresetKey,
@@ -29,27 +26,36 @@ import {
 
 type PreparedFile = {
   file: File;
-  transferBytes: Uint8Array;
-  compression: CompressionMode;
-  originalCrc: number;
+  optical: PreparedOpticalFile;
 };
 
-function descriptorCadence(lanes: number) {
-  return lanes === 1 ? 8 : 16;
-}
-
-function dataFramesPerSecond(
-  preset: (typeof TRANSFER_PRESETS)[TransferPresetKey],
-) {
-  return preset.fps * (preset.lanes - 1 / descriptorCadence(preset.lanes));
+function evenlyInterleave(source: number[], repair: number[]) {
+  if (source.length === 0) return [...repair];
+  if (repair.length === 0) return [...source];
+  const order: number[] = [];
+  let repairIndex = 0;
+  let accumulator = 0;
+  for (const sourceIndex of source) {
+    order.push(sourceIndex);
+    accumulator += repair.length;
+    while (repairIndex < repair.length && accumulator >= source.length) {
+      order.push(repair[repairIndex]);
+      repairIndex += 1;
+      accumulator -= source.length;
+    }
+  }
+  while (repairIndex < repair.length) {
+    order.push(repair[repairIndex]);
+    repairIndex += 1;
+  }
+  return order;
 }
 
 function estimateDuration(
-  source: TransferSource,
+  transfer: OpticalTransfer,
   preset: (typeof TRANSFER_PRESETS)[TransferPresetKey],
 ) {
-  const usefulFramesPerSecond = dataFramesPerSecond(preset) * 0.68;
-  const seconds = source.meta.blockCount / usefulFramesPerSecond;
+  const seconds = transfer.sourcePacketCount / (preset.fps * 0.78);
   if (seconds < 60) return `about ${Math.max(1, Math.ceil(seconds))} sec`;
   const minutes = seconds / 60;
   return `about ${minutes >= 10 ? Math.ceil(minutes) : minutes.toFixed(1)} min`;
@@ -57,180 +63,168 @@ function estimateDuration(
 
 export function SendClient() {
   const inputRef = useRef<HTMLInputElement>(null);
-  const canvasRefs = useRef<Array<HTMLCanvasElement | null>>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const qrStageRef = useRef<HTMLDivElement>(null);
-  const sourceRef = useRef<TransferSource | undefined>(undefined);
-  const sequenceRef = useRef(0);
-  const batchRef = useRef(0);
+  const transferRef = useRef<OpticalTransfer | undefined>(undefined);
+  const orderRef = useRef<number[]>([]);
+  const playedFramesRef = useRef(0);
+  const encodeJobRef = useRef(0);
   const [fileData, setFileData] = useState<PreparedFile>();
-  const [source, setSource] = useState<TransferSource>();
+  const [transfer, setTransfer] = useState<OpticalTransfer>();
   const [presetKey, setPresetKey] = useState<TransferPresetKey>("robust");
   const [playing, setPlaying] = useState(false);
   const [processing, setProcessing] = useState(false);
-  const [frameNumber, setFrameNumber] = useState(0);
+  const [playedFrames, setPlayedFrames] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const preset = TRANSFER_PRESETS[presetKey];
 
-  useEffect(() => {
-    sourceRef.current = source;
-  }, [source]);
+  const installTransfer = useCallback((next: OpticalTransfer) => {
+    const order = evenlyInterleave(
+      next.sourcePacketIndices,
+      next.repairPacketIndices,
+    );
+    transferRef.current = next;
+    orderRef.current = order;
+    playedFramesRef.current = 0;
+    setPlayedFrames(0);
+    setTransfer(next);
+  }, []);
 
-  const makeSource = useCallback(
-    (
+  const encodePrepared = useCallback(
+    async (
       prepared: PreparedFile,
-      nextPreset: (typeof TRANSFER_PRESETS)[TransferPresetKey],
-    ) =>
-      createTransferSource(prepared.transferBytes, {
-        filename: prepared.file.name,
-        mime: prepared.file.type || "application/octet-stream",
-        blockSize: nextPreset.blockSize,
-        originalSize: prepared.file.size,
-        originalCrc: prepared.originalCrc,
-        compression: prepared.compression,
-      }),
-    [],
+      nextPresetKey: TransferPresetKey,
+    ) => {
+      const job = encodeJobRef.current + 1;
+      encodeJobRef.current = job;
+      setProcessing(true);
+      setError("");
+      try {
+        const nextPreset = TRANSFER_PRESETS[nextPresetKey];
+        const next = await createOpticalTransfer(prepared.optical, {
+          symbolSize: nextPreset.symbolSize,
+          repairPercent: nextPreset.repairPercent,
+        });
+        if (encodeJobRef.current === job) installTransfer(next);
+      } catch (cause) {
+        if (encodeJobRef.current === job) {
+          setTransfer(undefined);
+          transferRef.current = undefined;
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : "The RaptorQ stream could not be prepared.",
+          );
+        }
+      } finally {
+        if (encodeJobRef.current === job) setProcessing(false);
+      }
+    },
+    [installTransfer],
   );
-
-  const resetBroadcast = (nextSource: TransferSource) => {
-    setSource(nextSource);
-    sourceRef.current = nextSource;
-    sequenceRef.current = 0;
-    batchRef.current = 0;
-    setFrameNumber(0);
-  };
 
   const prepareFile = useCallback(
     async (file: File) => {
       setError("");
       setPlaying(false);
       if (file.size > MAX_FILE_BYTES) {
-        setError("Choose a file smaller than 512 MB for this browser-based build.");
+        setError("Choose a file smaller than 512 MB for this browser build.");
         return;
       }
       setProcessing(true);
       try {
-        const originalBytes = new Uint8Array(await file.arrayBuffer());
-        const originalCrc = crc32(originalBytes);
-        const compressed = await compressForTransfer(originalBytes);
+        const original = new Uint8Array(await file.arrayBuffer());
+        const compressed = await compressForTransfer(original);
         const prepared: PreparedFile = {
           file,
-          transferBytes: compressed.bytes,
-          compression: compressed.mode,
-          originalCrc,
+          optical: buildOpticalContainer(original, compressed.bytes, {
+            filename: file.name,
+            mime: file.type || "application/octet-stream",
+            compression: compressed.mode,
+          }),
         };
-        const nextSource = makeSource(prepared, preset);
         setFileData(prepared);
-        resetBroadcast(nextSource);
+        await encodePrepared(prepared, presetKey);
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "The file could not be prepared.");
-      } finally {
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "The file could not be prepared.",
+        );
         setProcessing(false);
       }
     },
-    [makeSource, preset],
+    [encodePrepared, presetKey],
   );
 
   const changePreset = (nextKey: TransferPresetKey) => {
     setPresetKey(nextKey);
     setPlaying(false);
-    if (fileData) resetBroadcast(makeSource(fileData, TRANSFER_PRESETS[nextKey]));
+    if (fileData) void encodePrepared(fileData, nextKey);
   };
 
-  const renderCode = useCallback(
+  const renderPacket = useCallback(
     async (
-      canvas: HTMLCanvasElement | null,
-      encoded: string,
-      errorCorrectionLevel: "L" | "M" | "Q" | "H",
-      lanes: number,
+      target: OpticalTransfer,
+      packetIndex: number,
+      activePreset: (typeof TRANSFER_PRESETS)[TransferPresetKey],
     ) => {
+      const canvas = canvasRef.current;
       if (!canvas) return;
-      await QRCode.toCanvas(canvas, encoded, {
-        width: lanes === 1 ? 900 : 440,
-        margin: lanes === 1 ? 6 : 4,
-        errorCorrectionLevel,
-        color: { dark: "#000000", light: "#ffffff" },
-      });
+      const { renderRawQr } = await import("@/lib/qr-renderer");
+      const image = await renderRawQr(
+        target.packets[packetIndex],
+        activePreset.version,
+        activePreset.ecc,
+        activePreset.renderScale,
+      );
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext("2d", { alpha: false });
+      if (!context) throw new Error("The QR drawing surface is unavailable.");
+      context.putImageData(image, 0, 0);
     },
     [],
   );
 
-  const renderPreview = useCallback(
-    async (target: TransferSource) => {
-      const descriptor = encodeDescriptor(target);
-      await Promise.all(
-        Array.from({ length: preset.lanes }, (_, lane) =>
-          renderCode(canvasRefs.current[lane], descriptor, "H", preset.lanes),
-        ),
-      );
-    },
-    [preset.lanes, renderCode],
-  );
-
-  const renderBatch = useCallback(
-    async (target: TransferSource) => {
-      const cadence = descriptorCadence(preset.lanes);
-      let nextSequence = sequenceRef.current;
-      const currentBatch = batchRef.current;
-      const renders = Array.from({ length: preset.lanes }, (_, lane) => {
-        const isDescriptor = lane === 0 && currentBatch % cadence === 0;
-        if (isDescriptor) {
-          return renderCode(
-            canvasRefs.current[lane],
-            encodeDescriptor(target),
-            "H",
-            preset.lanes,
-          );
-        }
-        const encoded = encodeDroplet(createDroplet(target, nextSequence));
-        nextSequence = (nextSequence + 1) >>> 0;
-        if (nextSequence === 0) nextSequence = target.meta.blockCount;
-        return renderCode(
-          canvasRefs.current[lane],
-          encoded,
-          preset.ecc,
-          preset.lanes,
-        );
-      });
-      await Promise.all(renders);
-      sequenceRef.current = nextSequence;
-      batchRef.current = currentBatch + 1;
-      setFrameNumber(nextSequence);
-    },
-    [preset.ecc, preset.lanes, renderCode],
-  );
+  useEffect(() => {
+    if (!transfer || orderRef.current.length === 0) return;
+    void renderPacket(transfer, orderRef.current[0], preset).catch(() =>
+      setError("The QR preview could not be rendered."),
+    );
+  }, [preset, renderPacket, transfer]);
 
   useEffect(() => {
-    if (!source) return;
-    renderPreview(source).catch(() => setError("The QR preview could not be rendered."));
-  }, [renderPreview, source]);
-
-  useEffect(() => {
-    if (!playing || !source) return;
+    if (!playing || !transfer) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const interval = 1000 / preset.fps;
     const tick = async () => {
       const started = performance.now();
-      const activeSource = sourceRef.current;
-      if (!activeSource || cancelled) return;
+      const activeTransfer = transferRef.current;
+      const order = orderRef.current;
+      if (!activeTransfer || order.length === 0 || cancelled) return;
+      const packetIndex = order[playedFramesRef.current % order.length];
       try {
-        await renderBatch(activeSource);
+        await renderPacket(activeTransfer, packetIndex, preset);
       } catch {
         setError("QR rendering paused after an unexpected error.");
         setPlaying(false);
         return;
       }
+      playedFramesRef.current += 1;
+      setPlayedFrames(playedFramesRef.current);
       const remaining = Math.max(0, interval - (performance.now() - started));
       timer = setTimeout(tick, remaining);
     };
-    tick();
+    void tick();
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [playing, preset.fps, renderBatch, source]);
+  }, [playing, preset, renderPacket, transfer]);
 
   const selectFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -261,21 +255,41 @@ export function SendClient() {
 
   const toggleFullscreen = async () => {
     if (!qrStageRef.current) return;
-    if (document.fullscreenElement) await document.exitFullscreen();
-    else await qrStageRef.current.requestFullscreen();
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        setPlaying(true);
+        await qrStageRef.current.requestFullscreen();
+      }
+    } catch {
+      setPlaying(false);
+      setError("Fullscreen is not available in this browser. Maximize the window instead.");
+    }
   };
 
-  const systematicProgress = source
-    ? Math.min(1, frameNumber / source.meta.blockCount)
-    : 0;
-  const repairFrames = source
-    ? Math.max(0, frameNumber - source.meta.blockCount)
-    : 0;
-  const compressionPercent =
-    source && source.meta.fileSize > 0
-      ? Math.round((1 - source.meta.transmittedSize / source.meta.fileSize) * 100)
+  const orderLength = transfer?.packets.length ?? 0;
+  const cycleFrame =
+    orderLength > 0
+      ? playedFrames === 0
+        ? 0
+        : ((playedFrames - 1) % orderLength) + 1
       : 0;
-  const nominalRate = preset.blockSize * dataFramesPerSecond(preset);
+  const cycleNumber =
+    orderLength > 0 && playedFrames > 0
+      ? Math.floor((playedFrames - 1) / orderLength) + 1
+      : 1;
+  const cycleProgress = orderLength ? cycleFrame / orderLength : 0;
+  const compressionPercent =
+    transfer && transfer.meta.fileSize > 0
+      ? Math.max(
+          0,
+          Math.round(
+            (1 - transfer.meta.transmittedSize / transfer.meta.fileSize) * 100,
+          ),
+        )
+      : 0;
+  const nominalRate = preset.usefulBytesPerFrame * preset.fps;
 
   return (
     <main>
@@ -286,13 +300,13 @@ export function SendClient() {
         </div>
         <div className="hero-copy">
           <p>
-            Your file stays on your devices. QRFerry compresses it, then moves
-            compact repair frames through one or four parallel QR channels.
+            Your file stays on your devices. QRFerry compresses it, then sends
+            raw binary through a loss-tolerant RaptorQ stream.
           </p>
           <div className="trust-row">
             <span>Local only</span>
-            <span>Level-9 compression</span>
-            <span>4× spatial lanes</span>
+            <span>Brotli-11 + gzip-9</span>
+            <span>RaptorQ FEC</span>
           </div>
         </div>
       </section>
@@ -330,20 +344,20 @@ export function SendClient() {
               onClick={() => inputRef.current?.click()}
             >
               <span aria-hidden="true">{processing ? "…" : "＋"}</span>
-              {processing ? "Compressing at level 9" : "Browse files"}
+              {processing ? "Compressing + building stream" : "Browse files"}
             </button>
             <p>or drop one here · up to 512 MB</p>
           </div>
 
-          {fileData && source ? (
+          {fileData ? (
             <div className="selected-file">
               <span className="file-glyph" aria-hidden="true">↗</span>
               <div>
-                <strong>{fileData.file.name}</strong>
+                <strong>{fileData.optical.meta.filename}</strong>
                 <span>
-                  {formatBytes(source.meta.fileSize)}
-                  {source.meta.compression === "gzip"
-                    ? ` → ${formatBytes(source.meta.transmittedSize)} · ${compressionPercent}% smaller`
+                  {formatBytes(fileData.optical.meta.fileSize)}
+                  {fileData.optical.meta.compression !== "none"
+                    ? ` → ${formatBytes(fileData.optical.meta.transmittedSize)} · ${compressionPercent}% smaller · ${fileData.optical.meta.compression}`
                     : " · already compressed"}
                 </span>
               </div>
@@ -357,7 +371,7 @@ export function SendClient() {
             <span>02</span>
             <div>
               <h2>Tune the channel</h2>
-              <p>Turbo uses four independently recoverable QR lanes.</p>
+              <p>Every mode uses one stable target; density and pace change.</p>
             </div>
           </div>
 
@@ -378,7 +392,10 @@ export function SendClient() {
                     <strong>{option.label}</strong>
                     <small>{option.description}</small>
                   </span>
-                  <b>{option.lanes}× · {formatRate(option.blockSize * option.fps * option.lanes)}</b>
+                  <b>
+                    {option.fps} fps ·{" "}
+                    {formatRate(option.usefulBytesPerFrame * option.fps)}
+                  </b>
                 </button>
               );
             })}
@@ -392,39 +409,34 @@ export function SendClient() {
             <span>03</span>
             <div>
               <h2>Play the QR stream</h2>
-              <p>{preset.lanes === 4 ? "Keep all four codes inside the phone guide." : "Keep the complete code inside the phone guide."}</p>
+              <p>Fill the phone guide with this one complete code.</p>
             </div>
           </div>
 
           <div
             ref={qrStageRef}
-            className={`qr-stage ${source ? "ready" : ""} lanes-${preset.lanes}`}
+            className={`qr-stage ${transfer ? "ready" : ""} ${playing ? "playing" : ""} lanes-1`}
           >
-            {source ? (
-              <div className={`qr-canvas-grid lanes-${preset.lanes}`}>
-                {Array.from({ length: preset.lanes }, (_, lane) => (
-                  <canvas
-                    key={`${presetKey}-${lane}`}
-                    ref={(element) => {
-                      canvasRefs.current[lane] = element;
-                    }}
-                    aria-label={`Animated QR transfer lane ${lane + 1}`}
-                  />
-                ))}
+            {transfer ? (
+              <div className="qr-canvas-grid lanes-1">
+                <canvas
+                  ref={canvasRef}
+                  aria-label="Animated RaptorQ file transfer"
+                />
               </div>
             ) : (
               <div className="qr-placeholder" aria-hidden="true">
                 <div className="finder top-left" />
                 <div className="finder top-right" />
                 <div className="finder bottom-left" />
-                <span>QR stream appears here</span>
+                <span>{processing ? "Encoding stream…" : "QR stream appears here"}</span>
               </div>
             )}
             <button
               className="fullscreen-button"
               type="button"
               onClick={toggleFullscreen}
-              disabled={!source}
+              disabled={!transfer}
               aria-label="Show QR code fullscreen"
             >
               ⛶
@@ -434,31 +446,42 @@ export function SendClient() {
           <div className="stream-status" aria-live="polite">
             <div>
               <span className={`pulse-dot ${playing ? "live" : ""}`} aria-hidden="true" />
-              <strong>{playing ? "Broadcasting" : source ? "Ready to broadcast" : "Waiting for a file"}</strong>
+              <strong>
+                {playing
+                  ? "Broadcasting"
+                  : transfer
+                    ? "Ready to broadcast"
+                    : processing
+                      ? "Encoding"
+                      : "Waiting for a file"}
+              </strong>
             </div>
             <span>
-              {source
-                ? `${estimateDuration(source, preset)} · ${formatRate(nominalRate)} nominal`
+              {transfer
+                ? `${estimateDuration(transfer, preset)} · ${formatRate(nominalRate)} nominal`
                 : "Camera never needs a network connection"}
             </span>
           </div>
 
-          {source ? (
+          {transfer ? (
             <div className="broadcast-progress">
               <div>
-                <strong>
-                  {frameNumber < source.meta.blockCount
-                    ? "Systematic source pass"
-                    : "Loss-repair pass"}
-                </strong>
+                <strong>RaptorQ cycle {cycleNumber}</strong>
                 <span>
-                  {frameNumber < source.meta.blockCount
-                    ? `${frameNumber.toLocaleString()} / ${source.meta.blockCount.toLocaleString()} frames`
-                    : `source complete · ${repairFrames.toLocaleString()} repair frames`}
+                  frame {cycleFrame.toLocaleString()} /{" "}
+                  {orderLength.toLocaleString()} ·{" "}
+                  {transfer.sourcePacketCount.toLocaleString()} source +{" "}
+                  {transfer.repairPacketIndices.length.toLocaleString()} repair
                 </span>
               </div>
-              <div className="broadcast-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(systematicProgress * 100)}>
-                <span style={{ width: `${systematicProgress * 100}%` }} />
+              <div
+                className="broadcast-track"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(cycleProgress * 100)}
+              >
+                <span style={{ width: `${cycleProgress * 100}%` }} />
               </div>
             </div>
           ) : null}
@@ -466,11 +489,11 @@ export function SendClient() {
           <button
             className="primary-action"
             type="button"
-            disabled={!source || processing}
+            disabled={!transfer || processing}
             onClick={() => setPlaying((current) => !current)}
           >
             <span aria-hidden="true">{playing ? "Ⅱ" : "▶"}</span>
-            {playing ? "Pause stream" : `Start ${preset.lanes === 4 ? "4-lane " : ""}QR stream`}
+            {playing ? "Pause stream" : "Start QR stream"}
           </button>
 
           <button className="link-action" type="button" onClick={copyScanLink}>
@@ -487,17 +510,17 @@ export function SendClient() {
           <div className="feature">
             <span>01</span>
             <h3>Compress first</h3>
-            <p>Level-9 DEFLATE removes redundancy before a single optical frame is spent.</p>
+            <p>Brotli quality 11 races gzip level 9; only the smallest result crosses the camera.</p>
           </div>
           <div className="feature">
             <span>02</span>
-            <h3>Spatial multiplexing</h3>
-            <p>Turbo carries four compact QR symbols per camera exposure instead of over-densifying one.</p>
+            <h3>Raw binary QR</h3>
+            <p>Byte-mode symbols remove Base45 expansion while one stable finder geometry stays easy to track.</p>
           </div>
           <div className="feature">
             <span>03</span>
-            <h3>Compact fountain frames</h3>
-            <p>Metadata beacons are separated from payload frames; repair data continues until every block verifies.</p>
+            <h3>RaptorQ across time</h3>
+            <p>Source and repair symbols are interleaved, so blur and dropped exposures become harmless erasures.</p>
           </div>
         </div>
       </section>

@@ -1,44 +1,48 @@
 "use client";
 
-import jsQR from "jsqr";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { decompressTransfer } from "@/lib/compression";
 import {
   crc32,
-  decodeTransferFrame,
-  FountainDecoder,
   formatBytes,
   formatRate,
-  FRAME_PREFIX,
-  LEGACY_FRAME_PREFIXES,
-  TransferMeta,
-} from "@/lib/qr-transfer";
+  OpticalFileMeta,
+  parseOpticalContainer,
+  parseOpticalFrame,
+  raptorPacketKey,
+} from "@/lib/optical-transfer";
 
-type ScanState = "idle" | "starting" | "scanning" | "receiving" | "complete" | "error";
-type DetectorMode = "native" | "software";
-type DetectedBarcode = { rawValue?: string };
-type NativeBarcodeDetector = {
-  detect(source: CanvasImageSource): Promise<DetectedBarcode[]>;
-};
-type BarcodeDetectorConstructor = {
-  new (options: { formats: string[] }): NativeBarcodeDetector;
-  getSupportedFormats?: () => Promise<string[]>;
-};
+type ScanState =
+  | "idle"
+  | "starting"
+  | "scanning"
+  | "receiving"
+  | "complete"
+  | "error";
 type RateSample = { at: number; bytes: number };
-
-function getBarcodeDetectorConstructor() {
-  return (
-    globalThis as typeof globalThis & {
-      BarcodeDetector?: BarcodeDetectorConstructor;
-    }
-  ).BarcodeDetector;
-}
+type RaptorDecoder = { push(payload: Uint8Array): Uint8Array | null };
+type ReceiverSession = {
+  session: number;
+  containerLength: number;
+  originalSize: number;
+  compressed: boolean;
+  symbolSize: number;
+  sourcePacketCount: number;
+  decoder: RaptorDecoder;
+  seen: Set<string>;
+};
+type IncomingMeta = Omit<ReceiverSession, "decoder" | "seen">;
+type VideoWithFrameCallback = HTMLVideoElement & {
+  requestVideoFrameCallback?: (
+    callback: (now: number, metadata: unknown) => void,
+  ) => number;
+};
 
 function updateRollingRate(samples: RateSample[], bytes: number) {
   const now = performance.now();
   samples.push({ at: now, bytes });
-  while (samples.length > 1 && now - samples[0].at > 5000) samples.shift();
-  const elapsed = Math.max(1000, now - samples[0].at);
+  while (samples.length > 1 && now - samples[0].at > 4000) samples.shift();
+  const elapsed = Math.max(750, now - samples[0].at);
   const total = samples.reduce((sum, sample) => sum + sample.bytes, 0);
   return (total * 1000) / elapsed;
 }
@@ -54,8 +58,7 @@ export function ScannerClient() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | undefined>(undefined);
-  const detectorRef = useRef<NativeBarcodeDetector | undefined>(undefined);
-  const decoderRef = useRef(new FountainDecoder());
+  const receiverRef = useRef<ReceiverSession | undefined>(undefined);
   const scanningRef = useRef(false);
   const completingRef = useRef(false);
   const downloadUrlRef = useRef("");
@@ -63,22 +66,23 @@ export function ScannerClient() {
   const lastQrAtRef = useRef(0);
   const qrReadsRef = useRef(0);
   const acceptedFramesRef = useRef(0);
-  const lastSolvedRef = useRef(0);
-  const channelSamplesRef = useRef<RateSample[]>([]);
-  const usefulSamplesRef = useRef<RateSample[]>([]);
+  const missedExposuresRef = useRef(0);
+  const decodeFailuresRef = useRef(0);
+  const rateSamplesRef = useRef<RateSample[]>([]);
   const [state, setState] = useState<ScanState>("idle");
   const [progress, setProgress] = useState(0);
-  const [solved, setSolved] = useState(0);
   const [frames, setFrames] = useState(0);
   const [qrReads, setQrReads] = useState(0);
+  const [missedExposures, setMissedExposures] = useState(0);
   const [badFrames, setBadFrames] = useState(0);
-  const [channelRate, setChannelRate] = useState(0);
-  const [usefulRate, setUsefulRate] = useState(0);
-  const [meta, setMeta] = useState<TransferMeta>();
+  const [opticalRate, setOpticalRate] = useState(0);
+  const [incoming, setIncoming] = useState<IncomingMeta>();
+  const [fileMeta, setFileMeta] = useState<OpticalFileMeta>();
   const [downloadUrl, setDownloadUrl] = useState("");
   const [error, setError] = useState("");
-  const [guidance, setGuidance] = useState("Center the entire QR field inside the four corners.");
-  const [detectorMode, setDetectorMode] = useState<DetectorMode>("software");
+  const [guidance, setGuidance] = useState(
+    "Center the complete QR inside the four corners.",
+  );
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
@@ -88,111 +92,146 @@ export function ScannerClient() {
     streamRef.current = undefined;
   }, []);
 
-  const finishTransfer = useCallback(async () => {
-    if (completingRef.current) return;
-    completingRef.current = true;
-    const decoder = decoderRef.current;
-    try {
-      setGuidance(
-        decoder.meta?.compression === "gzip"
-          ? "Optical transfer complete. Decompressing and verifying…"
-          : "Optical transfer complete. Verifying the file…",
-      );
-      const transmitted = decoder.result();
-      const bytes = await decompressTransfer(
-        transmitted,
-        decoder.meta?.compression ?? "none",
-      );
-      if (
-        !decoder.meta ||
-        bytes.length !== decoder.meta.fileSize ||
-        crc32(bytes) !== decoder.meta.fileCrc
-      ) {
-        throw new Error("The recovered file checksum did not match.");
-      }
-      const type = decoder.meta.mime || "application/octet-stream";
-      const fileBytes = Uint8Array.from(bytes);
-      const url = URL.createObjectURL(new Blob([fileBytes.buffer], { type }));
-      if (downloadUrlRef.current) URL.revokeObjectURL(downloadUrlRef.current);
-      downloadUrlRef.current = url;
-      setDownloadUrl(url);
-      setProgress(1);
-      setGuidance("File decompressed and checksum verified. It is safe to save.");
-      setState("complete");
-      stopCamera();
-      navigator.vibrate?.([80, 40, 120]);
-    } catch (cause) {
-      setState("error");
-      setError(cause instanceof Error ? cause.message : "File verification failed.");
-      stopCamera();
-    } finally {
-      completingRef.current = false;
-    }
-  }, [stopCamera]);
+  const finishTransfer = useCallback(
+    async (container: Uint8Array, session: ReceiverSession) => {
+      if (completingRef.current) return;
+      completingRef.current = true;
+      try {
+        setGuidance(
+          session.compressed
+            ? "Optical transfer complete. Decompressing and verifying…"
+            : "Optical transfer complete. Verifying the file…",
+        );
+        if (
+          container.length !== session.containerLength ||
+          crc32(container) !== session.session
+        ) {
+          throw new Error("The recovered RaptorQ object failed its checksum.");
+        }
+        const recovered = parseOpticalContainer(container);
+        const bytes = await decompressTransfer(
+          recovered.transmitted,
+          recovered.meta.compression,
+        );
+        if (
+          bytes.length !== recovered.meta.fileSize ||
+          crc32(bytes) !== recovered.meta.fileCrc
+        ) {
+          throw new Error("The recovered file checksum did not match.");
+        }
 
-  const acceptQrValue = useCallback(
-    (value: string) => {
+        const fileBytes = Uint8Array.from(bytes);
+        const url = URL.createObjectURL(
+          new Blob([fileBytes.buffer], { type: recovered.meta.mime }),
+        );
+        if (downloadUrlRef.current) URL.revokeObjectURL(downloadUrlRef.current);
+        downloadUrlRef.current = url;
+        setFileMeta(recovered.meta);
+        setDownloadUrl(url);
+        setProgress(1);
+        setGuidance("File decompressed and checksum verified. It is safe to save.");
+        setState("complete");
+        stopCamera();
+        navigator.vibrate?.([80, 40, 120]);
+      } catch (cause) {
+        setState("error");
+        setError(
+          cause instanceof Error ? cause.message : "File verification failed.",
+        );
+        stopCamera();
+      } finally {
+        completingRef.current = false;
+      }
+    },
+    [stopCamera],
+  );
+
+  const acceptQrBytes = useCallback(
+    async (bytes: Uint8Array) => {
       qrReadsRef.current += 1;
       lastQrAtRef.current = performance.now();
       setQrReads(qrReadsRef.current);
 
-      if (LEGACY_FRAME_PREFIXES.some((prefix) => value.startsWith(prefix))) {
-        setGuidance("An older QRFerry sender is visible. Reload the sending screen.");
-        return;
-      }
-      if (!value.startsWith(FRAME_PREFIX)) {
-        setGuidance("A QR code is visible, but it is not a current QRFerry transfer.");
-        return;
-      }
-
+      let frame;
       try {
-        const frame = decodeTransferFrame(value);
-        if (frame.kind === "descriptor") {
-          decoderRef.current.initialize(frame.meta);
-          setMeta(frame.meta);
-          setGuidance(
-            frame.meta.compression === "gzip"
-              ? "Transfer locked. Compressed payload frames are arriving."
-              : "Transfer locked. Payload frames are arriving.",
-          );
-          setState("receiving");
+        frame = parseOpticalFrame(bytes);
+      } catch {
+        const textPrefix = new TextDecoder().decode(bytes.subarray(0, 8));
+        if (textPrefix.startsWith("QF2") || textPrefix.startsWith("QF3")) {
+          setGuidance("An older QRFerry sender is visible. Reload the sending screen.");
           return;
         }
-
-        if (!decoderRef.current.meta) {
-          setGuidance("Payload seen. Waiting for the next metadata beacon.");
-          return;
-        }
-
-        const result = decoderRef.current.receiveData(frame);
-        if (result.accepted) {
-          acceptedFramesRef.current += 1;
-          const solvedDelta = Math.max(0, result.solved - lastSolvedRef.current);
-          lastSolvedRef.current = result.solved;
-          setFrames(acceptedFramesRef.current);
-          setSolved(result.solved);
-          setProgress(result.total ? result.solved / result.total : 0);
-          setChannelRate(
-            updateRollingRate(channelSamplesRef.current, frame.payload.length),
-          );
-          setUsefulRate(
-            updateRollingRate(
-              usefulSamplesRef.current,
-              solvedDelta * frame.payload.length,
-            ),
-          );
-          setGuidance("Signal locked. Keep the complete QR field inside the corners.");
-          setState(result.complete ? "receiving" : "receiving");
-          if (result.complete) void finishTransfer();
-        } else if (result.duplicate) {
-          setGuidance("Signal locked. Waiting for the sending screen to advance.");
-        }
-      } catch (cause) {
-        const message = cause instanceof Error ? cause.message : "";
         setBadFrames((current) => current + 1);
-        setGuidance("A frame was blurred or incomplete. Hold steady—the next one can replace it.");
-        if (message.includes("different transfer")) setError(message);
+        setGuidance("A frame was incomplete. Hold steady—the next one can replace it.");
+        return;
       }
+
+      let receiver = receiverRef.current;
+      if (!receiver) {
+        const { RaptorQWasmDecoder } = await import(
+          "@raptorqr/core/fec/raptorq_wasm"
+        );
+        const decoder = await RaptorQWasmDecoder.create(
+          frame.containerLength,
+          frame.symbolSize,
+        );
+        receiver = {
+          session: frame.session,
+          containerLength: frame.containerLength,
+          originalSize: frame.originalSize,
+          compressed: frame.compressed,
+          symbolSize: frame.symbolSize,
+          sourcePacketCount: Math.max(
+            1,
+            Math.ceil(frame.containerLength / (frame.symbolSize - 4)),
+          ),
+          decoder,
+          seen: new Set<string>(),
+        };
+        receiverRef.current = receiver;
+        setIncoming({
+          session: receiver.session,
+          containerLength: receiver.containerLength,
+          originalSize: receiver.originalSize,
+          compressed: receiver.compressed,
+          symbolSize: receiver.symbolSize,
+          sourcePacketCount: receiver.sourcePacketCount,
+        });
+        setGuidance("RaptorQ locked. Keep the full white margin visible.");
+        setState("receiving");
+      }
+
+      if (
+        frame.session !== receiver.session ||
+        frame.containerLength !== receiver.containerLength ||
+        frame.symbolSize !== receiver.symbolSize
+      ) {
+        setGuidance("A different transfer crossed the camera view. Stay on one sender.");
+        return;
+      }
+
+      const key = raptorPacketKey(frame);
+      if (receiver.seen.has(key)) {
+        setGuidance("Signal locked. Waiting for a new RaptorQ symbol.");
+        return;
+      }
+      receiver.seen.add(key);
+      acceptedFramesRef.current += 1;
+      const accepted = acceptedFramesRef.current;
+      const sourceBytes = Math.max(1, frame.symbolSize - 4);
+      const rate = updateRollingRate(rateSamplesRef.current, sourceBytes);
+      const estimatedProgress = Math.min(
+        0.99,
+        accepted / (receiver.sourcePacketCount + 2),
+      );
+      setFrames(accepted);
+      setOpticalRate(rate);
+      setProgress(estimatedProgress);
+      setGuidance("Signal locked. RaptorQ is absorbing dropped exposures.");
+      setState("receiving");
+
+      const decoded = receiver.decoder.push(frame.payload);
+      if (decoded) await finishTransfer(decoded, receiver);
     },
     [finishTransfer],
   );
@@ -213,14 +252,17 @@ export function ScannerClient() {
           return;
         }
 
-        const sourceSize = Math.floor(Math.min(video.videoWidth, video.videoHeight) * 0.94);
+        const sourceSize = Math.floor(
+          Math.min(video.videoWidth, video.videoHeight) * 0.96,
+        );
         const sourceX = Math.floor((video.videoWidth - sourceSize) / 2);
         const sourceY = Math.floor((video.videoHeight - sourceSize) / 2);
-        const scanSize = Math.min(800, sourceSize);
+        const scanSize = Math.min(960, sourceSize);
         canvas.width = scanSize;
         canvas.height = scanSize;
         const context = canvas.getContext("2d", { willReadFrequently: true });
         if (!context) return;
+        context.imageSmoothingEnabled = false;
         context.drawImage(
           video,
           sourceX,
@@ -233,83 +275,62 @@ export function ScannerClient() {
           scanSize,
         );
 
-        const values = new Set<string>();
-        if (detectorRef.current) {
-          try {
-            const barcodes = await detectorRef.current.detect(canvas);
-            for (const barcode of barcodes) {
-              if (barcode.rawValue) values.add(barcode.rawValue);
-            }
-          } catch {
-            detectorRef.current = undefined;
-            setDetectorMode("software");
+        const image = context.getImageData(0, 0, scanSize, scanSize);
+        const robustAttempt = decodeFailuresRef.current % 6 === 5;
+        const { scanRawQr } = await import("@/lib/qr-scanner");
+        const decoded = await scanRawQr(image, robustAttempt);
+
+        if (!decoded) {
+          decodeFailuresRef.current += 1;
+          missedExposuresRef.current += 1;
+          if (missedExposuresRef.current % 5 === 0) {
+            setMissedExposures(missedExposuresRef.current);
           }
+          return;
         }
-
-        if (values.size === 0) {
-          const fullImage = context.getImageData(0, 0, scanSize, scanSize);
-          const fullCode = jsQR(fullImage.data, scanSize, scanSize, {
-            inversionAttempts: "attemptBoth",
-          });
-          if (fullCode?.data) values.add(fullCode.data);
-
-          const fullWidth = fullCode
-            ? Math.hypot(
-                fullCode.location.topRightCorner.x - fullCode.location.topLeftCorner.x,
-                fullCode.location.topRightCorner.y - fullCode.location.topLeftCorner.y,
-              )
-            : 0;
-          const mayBeMultiplexed = !fullCode || fullWidth < scanSize * 0.55;
-          if (mayBeMultiplexed) {
-            const half = Math.floor(scanSize / 2);
-            for (let row = 0; row < 2; row += 1) {
-              for (let column = 0; column < 2; column += 1) {
-                const quadrant = context.getImageData(column * half, row * half, half, half);
-                const code = jsQR(quadrant.data, half, half, {
-                  inversionAttempts: "dontInvert",
-                });
-                if (code?.data) values.add(code.data);
-              }
-            }
-          }
-        }
-
-        for (const value of values) acceptQrValue(value);
+        decodeFailuresRef.current = 0;
+        await acceptQrBytes(decoded);
       };
 
-      void runScan().finally(() => {
-        if (scanningRef.current) {
-          window.setTimeout(
-            () => window.requestAnimationFrame(scanVideoFrame),
-            20,
-          );
-        }
-      });
+      void runScan()
+        .catch(() => {
+          decodeFailuresRef.current += 1;
+          missedExposuresRef.current += 1;
+        })
+        .finally(() => {
+          if (!scanningRef.current) return;
+          const video = videoRef.current as VideoWithFrameCallback | null;
+          if (video?.requestVideoFrameCallback) {
+            video.requestVideoFrameCallback(() => scanVideoFrame());
+          } else {
+            window.requestAnimationFrame(scanVideoFrame);
+          }
+        });
     },
-    [acceptQrValue],
+    [acceptQrBytes],
   );
 
   const startCamera = useCallback(async () => {
     setError("");
-    setGuidance("Center the entire QR field inside the four corners.");
+    setGuidance("Center the complete QR inside the four corners.");
     setState("starting");
-    decoderRef.current = new FountainDecoder();
+    receiverRef.current = undefined;
     completingRef.current = false;
     qrReadsRef.current = 0;
     acceptedFramesRef.current = 0;
-    lastSolvedRef.current = 0;
-    channelSamplesRef.current = [];
-    usefulSamplesRef.current = [];
+    missedExposuresRef.current = 0;
+    decodeFailuresRef.current = 0;
+    rateSamplesRef.current = [];
     lastQrAtRef.current = 0;
     scanStartedAtRef.current = performance.now();
-    setMeta(undefined);
+    setIncoming(undefined);
+    setFileMeta(undefined);
     setProgress(0);
-    setSolved(0);
     setFrames(0);
     setQrReads(0);
+    setMissedExposures(0);
     setBadFrames(0);
-    setChannelRate(0);
-    setUsefulRate(0);
+    setOpticalRate(0);
     setTorchOn(false);
     if (downloadUrlRef.current) {
       URL.revokeObjectURL(downloadUrlRef.current);
@@ -318,24 +339,19 @@ export function ScannerClient() {
     }
 
     try {
-      const Detector = getBarcodeDetectorConstructor();
-      if (Detector) {
-        const formats = await Detector.getSupportedFormats?.();
-        if (!formats || formats.includes("qr_code")) {
-          detectorRef.current = new Detector({ formats: ["qr_code"] });
-          setDetectorMode("native");
-        }
-      }
-
+      const decoderLoad = import("@/lib/qr-scanner").then(({ prepareQrScanner }) =>
+        prepareQrScanner(),
+      );
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30 },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 60, min: 24 },
         },
       });
+      await decoderLoad;
       streamRef.current = stream;
       const track = stream.getVideoTracks()[0];
       const capabilities = track.getCapabilities?.() as MediaTrackCapabilities & {
@@ -356,7 +372,12 @@ export function ScannerClient() {
       }
       scanningRef.current = true;
       setState("scanning");
-      window.requestAnimationFrame(scanVideo);
+      const video = videoRef.current as VideoWithFrameCallback | null;
+      if (video?.requestVideoFrameCallback) {
+        video.requestVideoFrameCallback(() => scanVideo());
+      } else {
+        window.requestAnimationFrame(scanVideo);
+      }
     } catch (cause) {
       stopCamera();
       setState("error");
@@ -374,7 +395,9 @@ export function ScannerClient() {
     if (!track) return;
     const next = !torchOn;
     try {
-      await track.applyConstraints({ advanced: [{ torch: next } as MediaTrackConstraintSet] });
+      await track.applyConstraints({
+        advanced: [{ torch: next } as MediaTrackConstraintSet],
+      });
       setTorchOn(next);
     } catch {
       setTorchAvailable(false);
@@ -388,9 +411,9 @@ export function ScannerClient() {
       if (lastQrAtRef.current > 0 && now - lastQrAtRef.current < 3000) return;
       const elapsed = now - scanStartedAtRef.current;
       if (elapsed > 8000) {
-        setGuidance("No QR detected. Use Robust mode, move closer, and keep every white margin visible.");
+        setGuidance("No frame decoded. Use Robust mode, move closer, and keep the white margin visible.");
       } else if (elapsed > 4000) {
-        setGuidance("Still looking. Move closer until the QR field nearly fills the guide.");
+        setGuidance("Still looking. Move closer until the single QR nearly fills the guide.");
       }
     }, 1000);
     return () => window.clearInterval(timer);
@@ -404,31 +427,42 @@ export function ScannerClient() {
   }, [stopCamera]);
 
   const complete = state === "complete";
-  const active = state === "scanning" || state === "receiving" || state === "starting";
+  const active =
+    state === "scanning" || state === "receiving" || state === "starting";
   const compressionRatio =
-    meta && meta.transmittedSize > 0 ? meta.fileSize / meta.transmittedSize : 1;
-  const effectiveRate = usefulRate * compressionRatio;
-  const recoveredBytes = meta
-    ? Math.min(meta.transmittedSize, solved * meta.blockSize)
+    incoming && incoming.containerLength > 0
+      ? incoming.originalSize / incoming.containerLength
+      : 1;
+  const effectiveRate = opticalRate * compressionRatio;
+  const recoveredBytes = incoming
+    ? Math.min(
+        incoming.containerLength,
+        frames * Math.max(1, incoming.symbolSize - 4),
+      )
     : 0;
   const etaSeconds =
-    meta && usefulRate > 0
-      ? (meta.transmittedSize - recoveredBytes) / usefulRate
+    incoming && opticalRate > 0
+      ? (incoming.containerLength - recoveredBytes) / opticalRate
       : Number.POSITIVE_INFINITY;
   const compressionPercent =
-    meta && meta.fileSize > 0
-      ? Math.round((1 - meta.transmittedSize / meta.fileSize) * 100)
+    incoming && incoming.originalSize > 0
+      ? Math.max(
+          0,
+          Math.round(
+            (1 - incoming.containerLength / incoming.originalSize) * 100,
+          ),
+        )
       : 0;
 
   return (
     <main className="scanner-page">
       <section className="scanner-intro">
-        <p className="eyebrow">MULTI-LANE MOBILE RECEIVER</p>
+        <p className="eyebrow">RAPTORQ MOBILE RECEIVER</p>
         <h1>{complete ? "File recovered." : "Point. Hold. Receive."}</h1>
         <p>
           {complete
-            ? "Every block passed both transmitted and original-file checksums."
-            : "The scanner can read one robust code or four parallel Turbo lanes per exposure."}
+            ? "The RaptorQ object and original file both passed end-to-end checksums."
+            : "A native-speed scanner reads one raw-binary QR per exposure; missed frames do not matter."}
         </p>
       </section>
 
@@ -446,7 +480,7 @@ export function ScannerClient() {
               <span>The video stays on this device.</span>
             </div>
           ) : null}
-          {state === "starting" ? <div className="camera-loading">Starting camera…</div> : null}
+          {state === "starting" ? <div className="camera-loading">Loading optical decoder…</div> : null}
           {complete ? <div className="complete-mark" aria-hidden="true">✓</div> : null}
           {torchAvailable && active ? (
             <button className="torch-button" type="button" onClick={toggleTorch}>
@@ -460,7 +494,7 @@ export function ScannerClient() {
             <span className={`pulse-dot ${active ? "live" : ""}`} aria-hidden="true" />
             <strong>
               {state === "receiving"
-                ? "Receiving compact repair frames"
+                ? "Receiving RaptorQ symbols"
                 : state === "scanning"
                   ? "Looking for QRFerry"
                   : complete
@@ -482,46 +516,55 @@ export function ScannerClient() {
 
           <div className="rate-panel" aria-live="polite">
             <div>
-              <span>Useful transfer rate</span>
+              <span>Effective file rate</span>
               <strong>{effectiveRate > 0 ? formatRate(effectiveRate) : "—"}</strong>
-              <small>{meta?.compression === "gzip" ? `${formatRate(usefulRate)} optical · ${compressionPercent}% compressed` : `${formatRate(channelRate)} optical channel`}</small>
+              <small>
+                {incoming?.compressed
+                  ? `${formatRate(opticalRate)} optical · ${compressionPercent}% compressed`
+                  : `${formatRate(opticalRate)} accepted optical data`}
+              </small>
             </div>
             <div>
               <span>Estimated remaining</span>
               <strong>{complete ? "Complete" : formatEta(etaSeconds)}</strong>
-              <small>{meta ? `${formatBytes(recoveredBytes)} of ${formatBytes(meta.transmittedSize)} encoded` : "Waiting for descriptor"}</small>
+              <small>
+                {incoming
+                  ? `${formatBytes(recoveredBytes)} of ${formatBytes(incoming.containerLength)} encoded`
+                  : "Waiting for first RaptorQ symbol"}
+              </small>
             </div>
           </div>
 
-          {meta ? (
+          {incoming ? (
             <div className="incoming-file">
               <span className="file-glyph" aria-hidden="true">↓</span>
               <div>
-                <strong>{meta.filename}</strong>
+                <strong>{fileMeta?.filename || "Incoming file"}</strong>
                 <span>
-                  {formatBytes(meta.fileSize)}
-                  {meta.compression === "gzip" ? ` · ${compressionPercent}% compression` : ""}
-                  {" · "}{solved.toLocaleString()} / {meta.blockCount.toLocaleString()} blocks
+                  {formatBytes(incoming.originalSize)}
+                  {incoming.compressed ? ` · ${compressionPercent}% compression` : ""}
+                  {" · "}
+                  {frames.toLocaleString()} / ~{incoming.sourcePacketCount.toLocaleString()} symbols
                 </span>
               </div>
-              <b>{frames}</b>
+              <b>RQ</b>
             </div>
           ) : null}
 
           <div className="scan-diagnostics" aria-live="polite">
             <span><b>{qrReads}</b> QR reads</span>
-            <span><b>{frames}</b> accepted</span>
-            <span><b>{badFrames}</b> blurred</span>
-            <span><b>{detectorMode}</b> detector</span>
+            <span><b>{frames}</b> unique</span>
+            <span><b>{missedExposures}</b> missed</span>
+            <span><b>{badFrames}</b> rejected</span>
           </div>
           <p className="scan-hint">{guidance}</p>
 
           {error ? <p className="error-message" role="alert">{error}</p> : null}
 
-          {complete && downloadUrl && meta ? (
-            <a className="primary-action" href={downloadUrl} download={meta.filename}>
+          {complete && downloadUrl && fileMeta ? (
+            <a className="primary-action" href={downloadUrl} download={fileMeta.filename}>
               <span aria-hidden="true">↓</span>
-              Save {meta.filename}
+              Save {fileMeta.filename}
             </a>
           ) : (
             <button
@@ -539,7 +582,7 @@ export function ScannerClient() {
               }
             >
               <span aria-hidden="true">{active ? "■" : "◎"}</span>
-              {state === "starting" ? "Starting…" : active ? "Stop camera" : "Start camera"}
+              {state === "starting" ? "Loading…" : active ? "Stop camera" : "Start camera"}
             </button>
           )}
 
@@ -552,9 +595,9 @@ export function ScannerClient() {
       </section>
 
       <section className="scan-tips">
-        <div><span>1</span><p>Use Turbo only when all four codes remain sharp and visible.</p></div>
-        <div><span>2</span><p>Useful rate includes the gain from pre-transfer compression.</p></div>
-        <div><span>3</span><p>If accepted frames stall, step down one channel mode.</p></div>
+        <div><span>1</span><p>Use Turbo when a single QR stays sharp and nearly fills the guide.</p></div>
+        <div><span>2</span><p>The rate shown is measured from unique camera-decoded symbols.</p></div>
+        <div><span>3</span><p>If the missed counter climbs faster than unique reads, step down one mode.</p></div>
       </section>
     </main>
   );

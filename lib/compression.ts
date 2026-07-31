@@ -1,6 +1,6 @@
 import { gzip, gunzip } from "fflate";
 
-export type CompressionMode = "none" | "gzip";
+export type CompressionMode = "none" | "gzip" | "brotli";
 
 function gzipAsync(bytes: Uint8Array) {
   return new Promise<Uint8Array>((resolve, reject) => {
@@ -20,6 +20,18 @@ function gunzipAsync(bytes: Uint8Array) {
   });
 }
 
+async function brotliCompress(bytes: Uint8Array) {
+  const brotliPackage = await import("brotli-wasm");
+  const brotli = await brotliPackage.default;
+  return new Uint8Array(brotli.compress(bytes, { quality: 11 }));
+}
+
+async function brotliDecompress(bytes: Uint8Array) {
+  const brotliPackage = await import("brotli-wasm");
+  const brotli = await brotliPackage.default;
+  return new Uint8Array(brotli.decompress(bytes));
+}
+
 export async function compressForTransfer(bytes: Uint8Array): Promise<{
   bytes: Uint8Array;
   mode: CompressionMode;
@@ -29,15 +41,23 @@ export async function compressForTransfer(bytes: Uint8Array): Promise<{
     return { bytes, mode: "none", savedBytes: 0 };
   }
 
-  const compressed = await gzipAsync(bytes);
+  const gzipPromise = gzipAsync(bytes);
+  const brotliPromise = brotliCompress(bytes).catch(() => undefined);
+  const [gzipBytes, brotliBytes] = await Promise.all([
+    gzipPromise,
+    brotliPromise,
+  ]);
+  const best =
+    brotliBytes && brotliBytes.length < gzipBytes.length
+      ? { bytes: brotliBytes, mode: "brotli" as const }
+      : { bytes: gzipBytes, mode: "gzip" as const };
   // Keep a small safety margin: a token saving is not worth decompression work.
-  if (compressed.length + 64 >= bytes.length) {
+  if (best.bytes.length + 64 >= bytes.length) {
     return { bytes, mode: "none", savedBytes: 0 };
   }
   return {
-    bytes: compressed,
-    mode: "gzip",
-    savedBytes: bytes.length - compressed.length,
+    ...best,
+    savedBytes: bytes.length - best.bytes.length,
   };
 }
 
@@ -45,5 +65,7 @@ export async function decompressTransfer(
   bytes: Uint8Array,
   mode: CompressionMode,
 ) {
-  return mode === "gzip" ? gunzipAsync(bytes) : bytes;
+  if (mode === "gzip") return gunzipAsync(bytes);
+  if (mode === "brotli") return brotliDecompress(bytes);
+  return bytes;
 }
