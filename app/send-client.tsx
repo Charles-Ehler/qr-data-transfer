@@ -68,6 +68,7 @@ export function SendClient() {
   const transferRef = useRef<OpticalTransfer | undefined>(undefined);
   const orderRef = useRef<number[]>([]);
   const playedFramesRef = useRef(0);
+  const broadcastFrameTimesRef = useRef<number[]>([]);
   const encodeJobRef = useRef(0);
   const [fileData, setFileData] = useState<PreparedFile>();
   const [transfer, setTransfer] = useState<OpticalTransfer>();
@@ -75,6 +76,7 @@ export function SendClient() {
   const [playing, setPlaying] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [playedFrames, setPlayedFrames] = useState(0);
+  const [actualFps, setActualFps] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
@@ -129,6 +131,7 @@ export function SendClient() {
     async (file: File) => {
       setError("");
       setPlaying(false);
+      setActualFps(0);
       if (file.size > MAX_FILE_BYTES) {
         setError("Choose a file smaller than 512 MB for this browser build.");
         return;
@@ -162,6 +165,7 @@ export function SendClient() {
   const changePreset = (nextKey: TransferPresetKey) => {
     setPresetKey(nextKey);
     setPlaying(false);
+    setActualFps(0);
     if (fileData) void encodePrepared(fileData, nextKey);
   };
 
@@ -199,10 +203,16 @@ export function SendClient() {
   useEffect(() => {
     if (!playing || !transfer) return;
     let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let animationFrame = 0;
     const interval = 1000 / preset.fps;
-    const tick = async () => {
-      const started = performance.now();
+    let nextFrameAt = performance.now();
+    broadcastFrameTimesRef.current = [];
+
+    const tick = async (now: number) => {
+      if (now + 0.5 < nextFrameAt) {
+        animationFrame = window.requestAnimationFrame(tick);
+        return;
+      }
       const activeTransfer = transferRef.current;
       const order = orderRef.current;
       if (!activeTransfer || order.length === 0 || cancelled) return;
@@ -214,15 +224,39 @@ export function SendClient() {
         setPlaying(false);
         return;
       }
+      if (cancelled) return;
       playedFramesRef.current += 1;
-      setPlayedFrames(playedFramesRef.current);
-      const remaining = Math.max(0, interval - (performance.now() - started));
-      timer = setTimeout(tick, remaining);
+      const completedAt = performance.now();
+      const frameTimes = broadcastFrameTimesRef.current;
+      frameTimes.push(completedAt);
+      while (
+        frameTimes.length > 2 &&
+        completedAt - frameTimes[0] > 2500
+      ) {
+        frameTimes.shift();
+      }
+
+      const uiInterval = Math.max(1, Math.round(preset.fps / 10));
+      if (playedFramesRef.current % uiInterval === 0) {
+        setPlayedFrames(playedFramesRef.current);
+        if (frameTimes.length > 1) {
+          setActualFps(
+            ((frameTimes.length - 1) * 1000) /
+              (frameTimes[frameTimes.length - 1] - frameTimes[0]),
+          );
+        }
+      }
+
+      nextFrameAt += interval;
+      if (nextFrameAt < completedAt - interval) {
+        nextFrameAt = completedAt + interval;
+      }
+      animationFrame = window.requestAnimationFrame(tick);
     };
-    void tick();
+    animationFrame = window.requestAnimationFrame(tick);
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
+      window.cancelAnimationFrame(animationFrame);
     };
   }, [playing, preset, renderPacket, transfer]);
 
@@ -259,6 +293,7 @@ export function SendClient() {
       if (document.fullscreenElement) {
         await document.exitFullscreen();
       } else {
+        setActualFps(0);
         setPlaying(true);
         await qrStageRef.current.requestFullscreen();
       }
@@ -401,6 +436,14 @@ export function SendClient() {
             })}
           </div>
 
+          {preset.fps >= 30 ? (
+            <p className="channel-warning">
+              {presetKey === "megabit"
+                ? "Laboratory mode: make the QR fullscreen and let it nearly fill a sharp 60 fps camera frame."
+                : "Fast mode: watch the receiver’s delivered and scanner rates. Step down if valid unique reads stop increasing."}
+            </p>
+          ) : null}
+
           {error ? <p className="error-message" role="alert">{error}</p> : null}
         </div>
 
@@ -458,7 +501,11 @@ export function SendClient() {
             </div>
             <span>
               {transfer
-                ? `${estimateDuration(transfer, preset)} · ${formatRate(nominalRate)} nominal`
+                ? `${estimateDuration(transfer, preset)} · ${formatRate(nominalRate)} nominal${
+                    playing && actualFps > 0
+                      ? ` · ${actualFps.toFixed(1)} fps rendered`
+                      : ""
+                  }`
                 : "Camera never needs a network connection"}
             </span>
           </div>
@@ -490,7 +537,10 @@ export function SendClient() {
             className="primary-action"
             type="button"
             disabled={!transfer || processing}
-            onClick={() => setPlaying((current) => !current)}
+            onClick={() => {
+              if (!playing) setActualFps(0);
+              setPlaying((current) => !current);
+            }}
           >
             <span aria-hidden="true">{playing ? "Ⅱ" : "▶"}</span>
             {playing ? "Pause stream" : "Start QR stream"}

@@ -179,57 +179,61 @@ test("RaptorQ reconstructs after unordered camera-frame erasures", async () => {
   assert.deepEqual(recovered.transmitted, original);
 });
 
-test("the actual Turbo QR renderer and ZXing scanner preserve raw bytes", async () => {
+test("the actual Turbo and 1 Mbps QR profiles survive the ZXing scanner", async () => {
   await prepareZXing();
-  const preset = TRANSFER_PRESETS.turbo;
-  const packet = deterministicBytes(preset.qrCapacity);
-  const matrix = await encodeQRCodeMatrix(
-    packet,
-    preset.version,
-    preset.ecc,
-  );
-  const quietZone = 4;
-  const scale = 5;
-  const width = (matrix.length + quietZone * 2) * scale;
-  const rgba = new Uint8ClampedArray(width * width * 4);
-  const random = seededRandom(12345);
+  for (const preset of [
+    TRANSFER_PRESETS.turbo,
+    TRANSFER_PRESETS.megabit,
+  ]) {
+    const packet = deterministicBytes(preset.qrCapacity);
+    const matrix = await encodeQRCodeMatrix(
+      packet,
+      preset.version,
+      preset.ecc,
+    );
+    const quietZone = 4;
+    const scale = 5;
+    const width = (matrix.length + quietZone * 2) * scale;
+    const rgba = new Uint8ClampedArray(width * width * 4);
+    const random = seededRandom(12345 + preset.version);
 
-  for (let y = 0; y < width; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const moduleX = Math.floor(x / scale) - quietZone;
-      const moduleY = Math.floor(y / scale) - quietZone;
-      const dark =
-        moduleX >= 0 &&
-        moduleY >= 0 &&
-        moduleX < matrix.length &&
-        moduleY < matrix.length &&
-        matrix[moduleY][moduleX];
-      const noise = Math.floor(random() * 25);
-      const value = dark ? noise : 255 - noise;
-      const offset = (y * width + x) * 4;
-      rgba[offset] = value;
-      rgba[offset + 1] = value;
-      rgba[offset + 2] = value;
-      rgba[offset + 3] = 255;
+    for (let y = 0; y < width; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const moduleX = Math.floor(x / scale) - quietZone;
+        const moduleY = Math.floor(y / scale) - quietZone;
+        const dark =
+          moduleX >= 0 &&
+          moduleY >= 0 &&
+          moduleX < matrix.length &&
+          moduleY < matrix.length &&
+          matrix[moduleY][moduleX];
+        const noise = Math.floor(random() * 25);
+        const value = dark ? noise : 255 - noise;
+        const offset = (y * width + x) * 4;
+        rgba[offset] = value;
+        rgba[offset + 1] = value;
+        rgba[offset + 2] = value;
+        rgba[offset + 3] = 255;
+      }
     }
-  }
 
-  const options: ReaderOptions = {
-    formats: ["QRCode"],
-    tryHarder: true,
-    tryRotate: false,
-    tryInvert: false,
-    maxNumberOfSymbols: 1,
-  };
-  const results = await readBarcodes(
-    new TestImageData(rgba, width, width) as unknown as ImageData,
-    options,
-  );
-  assert.equal(results.length, 1);
-  assert.deepEqual(new Uint8Array(results[0].bytes), packet);
+    const options: ReaderOptions = {
+      formats: ["QRCode"],
+      tryHarder: true,
+      tryRotate: false,
+      tryInvert: false,
+      maxNumberOfSymbols: 1,
+    };
+    const results = await readBarcodes(
+      new TestImageData(rgba, width, width) as unknown as ImageData,
+      options,
+    );
+    assert.equal(results.length, 1, `${preset.label} should decode`);
+    assert.deepEqual(new Uint8Array(results[0].bytes), packet);
+  }
 });
 
-test("all profiles fit exactly and Turbo increases the single-target channel", () => {
+test("all profiles fit exactly and expose increasing high-speed channels", () => {
   for (const preset of Object.values(TRANSFER_PRESETS)) {
     assert.equal(
       preset.symbolSize + OPTICAL_FRAME_OVERHEAD,
@@ -239,6 +243,10 @@ test("all profiles fit exactly and Turbo increases the single-target channel", (
   }
   assert.equal(TRANSFER_PRESETS.turbo.version, 30);
   assert.equal(TRANSFER_PRESETS.turbo.fps, 15);
+  assert.equal(TRANSFER_PRESETS.turbo30.fps, 30);
+  assert.equal(TRANSFER_PRESETS.turbo60.fps, 60);
+  assert.equal(TRANSFER_PRESETS.megabit.version, 40);
+  assert.equal(TRANSFER_PRESETS.megabit.fps, 60);
   assert.ok(
     TRANSFER_PRESETS.turbo.usefulBytesPerFrame *
       TRANSFER_PRESETS.turbo.fps >
@@ -246,5 +254,20 @@ test("all profiles fit exactly and Turbo increases the single-target channel", (
         TRANSFER_PRESETS.robust.fps *
         5,
     "Turbo should offer more than 5x the nominal useful rate of Robust",
+  );
+  assert.equal(
+    TRANSFER_PRESETS.turbo30.usefulBytesPerFrame,
+    TRANSFER_PRESETS.turbo.usefulBytesPerFrame,
+  );
+  assert.equal(
+    TRANSFER_PRESETS.turbo60.usefulBytesPerFrame,
+    TRANSFER_PRESETS.turbo.usefulBytesPerFrame,
+  );
+  assert.ok(
+    TRANSFER_PRESETS.megabit.usefulBytesPerFrame *
+      TRANSFER_PRESETS.megabit.fps *
+      8 >
+      1_000_000,
+    "The 1 Mbps laboratory profile should exceed 1 Mbps before camera loss",
   );
 });

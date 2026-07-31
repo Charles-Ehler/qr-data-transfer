@@ -438,6 +438,16 @@ input:focus-visible {
   text-transform: uppercase;
 }
 
+.channel-warning {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--signal);
+  color: var(--muted);
+  background: rgba(231, 255, 84, 0.18);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .qr-stage {
   position: relative;
   width: min(100%, 580px);
@@ -1043,6 +1053,14 @@ input:focus-visible {
   margin-bottom: 10px;
   background: var(--line);
   border: 1px solid var(--line);
+}
+
+.channel-diagnostics {
+  margin-bottom: 1px;
+}
+
+.scan-diagnostics.channel-diagnostics span {
+  background: #eef3f5;
 }
 
 .scan-diagnostics span {

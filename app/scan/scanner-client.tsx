@@ -32,10 +32,29 @@ type ReceiverSession = {
   seen: Set<string>;
 };
 type IncomingMeta = Omit<ReceiverSession, "decoder" | "seen">;
+type VideoFrameMetadataLike = {
+  presentedFrames?: number;
+};
 type VideoWithFrameCallback = HTMLVideoElement & {
   requestVideoFrameCallback?: (
-    callback: (now: number, metadata: unknown) => void,
+    callback: (now: number, metadata: VideoFrameMetadataLike) => void,
   ) => number;
+};
+type DeliverySample = { at: number; frames: number };
+type ScanPerformanceSample = {
+  at: number;
+  decodeMs: number;
+};
+type CameraSettings = {
+  width: number;
+  height: number;
+  frameRate: number;
+};
+type ScanMetrics = {
+  deliveredFps: number;
+  scannerFps: number;
+  decodeP50: number;
+  decodeP95: number;
 };
 
 function updateRollingRate(samples: RateSample[], bytes: number) {
@@ -54,6 +73,12 @@ function formatEta(seconds: number) {
   return `${minutes >= 10 ? Math.ceil(minutes) : minutes.toFixed(1)} min`;
 }
 
+function percentile(values: number[], fraction: number) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))];
+}
+
 export function ScannerClient() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -69,6 +94,10 @@ export function ScannerClient() {
   const missedExposuresRef = useRef(0);
   const decodeFailuresRef = useRef(0);
   const rateSamplesRef = useRef<RateSample[]>([]);
+  const deliverySamplesRef = useRef<DeliverySample[]>([]);
+  const scanPerformanceRef = useRef<ScanPerformanceSample[]>([]);
+  const lastPresentedFramesRef = useRef(0);
+  const lastMetricsUpdateRef = useRef(0);
   const [state, setState] = useState<ScanState>("idle");
   const [progress, setProgress] = useState(0);
   const [frames, setFrames] = useState(0);
@@ -85,6 +114,13 @@ export function ScannerClient() {
   );
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
+  const [cameraSettings, setCameraSettings] = useState<CameraSettings>();
+  const [scanMetrics, setScanMetrics] = useState<ScanMetrics>({
+    deliveredFps: 0,
+    scannerFps: 0,
+    decodeP50: 0,
+    decodeP95: 0,
+  });
 
   const stopCamera = useCallback(() => {
     scanningRef.current = false;
@@ -227,7 +263,11 @@ export function ScannerClient() {
       setFrames(accepted);
       setOpticalRate(rate);
       setProgress(estimatedProgress);
-      setGuidance("Signal locked. RaptorQ is absorbing dropped exposures.");
+      setGuidance(
+        frame.symbolSize > 2200
+          ? "High-density stream locked. Keep the phone close, square, and completely still."
+          : "Signal locked. RaptorQ is absorbing dropped exposures.",
+      );
       setState("receiving");
 
       const decoded = receiver.decoder.push(frame.payload);
@@ -237,8 +277,27 @@ export function ScannerClient() {
   );
 
   const scanVideo = useCallback(
-    function scanVideoFrame() {
+    function scanVideoFrame(metadata?: VideoFrameMetadataLike) {
       if (!scanningRef.current) return;
+      const callbackAt = performance.now();
+      const reportedFrames = metadata?.presentedFrames;
+      const presentedFrames =
+        typeof reportedFrames === "number" &&
+        reportedFrames > lastPresentedFramesRef.current
+          ? reportedFrames
+          : lastPresentedFramesRef.current + 1;
+      lastPresentedFramesRef.current = presentedFrames;
+      const deliverySamples = deliverySamplesRef.current;
+      deliverySamples.push({ at: callbackAt, frames: presentedFrames });
+      while (
+        deliverySamples.length > 2 &&
+        callbackAt - deliverySamples[0].at > 3500
+      ) {
+        deliverySamples.shift();
+      }
+
+      let attempted = false;
+      let decodeMs = 0;
       const runScan = async () => {
         const video = videoRef.current;
         const canvas = canvasRef.current;
@@ -257,7 +316,13 @@ export function ScannerClient() {
         );
         const sourceX = Math.floor((video.videoWidth - sourceSize) / 2);
         const sourceY = Math.floor((video.videoHeight - sourceSize) / 2);
-        const scanSize = Math.min(960, sourceSize);
+        const robustAttempt = decodeFailuresRef.current % 6 === 5;
+        const highDensity =
+          (receiverRef.current?.symbolSize ?? 0) > 2200;
+        const scanSize = Math.min(
+          highDensity ? 1280 : robustAttempt ? 1120 : 960,
+          sourceSize,
+        );
         canvas.width = scanSize;
         canvas.height = scanSize;
         const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -276,9 +341,15 @@ export function ScannerClient() {
         );
 
         const image = context.getImageData(0, 0, scanSize, scanSize);
-        const robustAttempt = decodeFailuresRef.current % 6 === 5;
         const { scanRawQr } = await import("@/lib/qr-scanner");
-        const decoded = await scanRawQr(image, robustAttempt);
+        attempted = true;
+        const decodeStartedAt = performance.now();
+        let decoded: Uint8Array | null;
+        try {
+          decoded = await scanRawQr(image, robustAttempt);
+        } finally {
+          decodeMs = performance.now() - decodeStartedAt;
+        }
 
         if (!decoded) {
           decodeFailuresRef.current += 1;
@@ -299,11 +370,59 @@ export function ScannerClient() {
         })
         .finally(() => {
           if (!scanningRef.current) return;
+          const finishedAt = performance.now();
+          if (attempted) {
+            const performanceSamples = scanPerformanceRef.current;
+            performanceSamples.push({ at: finishedAt, decodeMs });
+            while (
+              performanceSamples.length > 2 &&
+              finishedAt - performanceSamples[0].at > 3500
+            ) {
+              performanceSamples.shift();
+            }
+
+            if (finishedAt - lastMetricsUpdateRef.current >= 500) {
+              const firstDelivery = deliverySamples[0];
+              const lastDelivery =
+                deliverySamples[deliverySamples.length - 1];
+              const deliveryElapsed =
+                lastDelivery && firstDelivery
+                  ? lastDelivery.at - firstDelivery.at
+                  : 0;
+              const deliveredFps =
+                deliveryElapsed > 0
+                  ? ((lastDelivery.frames - firstDelivery.frames) * 1000) /
+                    deliveryElapsed
+                  : 0;
+              const firstScan = performanceSamples[0];
+              const lastScan =
+                performanceSamples[performanceSamples.length - 1];
+              const scanElapsed =
+                lastScan && firstScan ? lastScan.at - firstScan.at : 0;
+              const scannerFps =
+                scanElapsed > 0
+                  ? ((performanceSamples.length - 1) * 1000) / scanElapsed
+                  : 0;
+              const decodeValues = performanceSamples.map(
+                (sample) => sample.decodeMs,
+              );
+              setScanMetrics({
+                deliveredFps,
+                scannerFps,
+                decodeP50: percentile(decodeValues, 0.5),
+                decodeP95: percentile(decodeValues, 0.95),
+              });
+              lastMetricsUpdateRef.current = finishedAt;
+            }
+          }
+
           const video = videoRef.current as VideoWithFrameCallback | null;
           if (video?.requestVideoFrameCallback) {
-            video.requestVideoFrameCallback(() => scanVideoFrame());
+            video.requestVideoFrameCallback((_now, nextMetadata) =>
+              scanVideoFrame(nextMetadata),
+            );
           } else {
-            window.requestAnimationFrame(scanVideoFrame);
+            window.requestAnimationFrame(() => scanVideoFrame());
           }
         });
     },
@@ -321,6 +440,10 @@ export function ScannerClient() {
     missedExposuresRef.current = 0;
     decodeFailuresRef.current = 0;
     rateSamplesRef.current = [];
+    deliverySamplesRef.current = [];
+    scanPerformanceRef.current = [];
+    lastPresentedFramesRef.current = 0;
+    lastMetricsUpdateRef.current = 0;
     lastQrAtRef.current = 0;
     scanStartedAtRef.current = performance.now();
     setIncoming(undefined);
@@ -332,6 +455,13 @@ export function ScannerClient() {
     setBadFrames(0);
     setOpticalRate(0);
     setTorchOn(false);
+    setCameraSettings(undefined);
+    setScanMetrics({
+      deliveredFps: 0,
+      scannerFps: 0,
+      decodeP50: 0,
+      decodeP95: 0,
+    });
     if (downloadUrlRef.current) {
       URL.revokeObjectURL(downloadUrlRef.current);
       downloadUrlRef.current = "";
@@ -354,6 +484,12 @@ export function ScannerClient() {
       await decoderLoad;
       streamRef.current = stream;
       const track = stream.getVideoTracks()[0];
+      const settings = track.getSettings();
+      setCameraSettings({
+        width: settings.width ?? 0,
+        height: settings.height ?? 0,
+        frameRate: settings.frameRate ?? 0,
+      });
       const capabilities = track.getCapabilities?.() as MediaTrackCapabilities & {
         focusMode?: string[];
         torch?: boolean;
@@ -374,9 +510,11 @@ export function ScannerClient() {
       setState("scanning");
       const video = videoRef.current as VideoWithFrameCallback | null;
       if (video?.requestVideoFrameCallback) {
-        video.requestVideoFrameCallback(() => scanVideo());
+        video.requestVideoFrameCallback((_now, metadata) =>
+          scanVideo(metadata),
+        );
       } else {
-        window.requestAnimationFrame(scanVideo);
+        window.requestAnimationFrame(() => scanVideo());
       }
     } catch (cause) {
       stopCamera();
@@ -551,6 +689,46 @@ export function ScannerClient() {
             </div>
           ) : null}
 
+          <div
+            className="scan-diagnostics channel-diagnostics"
+            aria-label="Live camera and decoder performance"
+          >
+            <span>
+              <b>
+                {cameraSettings?.frameRate
+                  ? cameraSettings.frameRate.toFixed(0)
+                  : "—"}{" "}
+                fps
+              </b>
+              negotiated
+            </span>
+            <span>
+              <b>
+                {scanMetrics.deliveredFps
+                  ? scanMetrics.deliveredFps.toFixed(1)
+                  : "—"}{" "}
+                fps
+              </b>
+              delivered
+            </span>
+            <span>
+              <b>
+                {scanMetrics.scannerFps
+                  ? scanMetrics.scannerFps.toFixed(1)
+                  : "—"}{" "}
+                fps
+              </b>
+              scanner
+            </span>
+            <span>
+              <b>
+                {scanMetrics.decodeP50
+                  ? `${scanMetrics.decodeP50.toFixed(0)} / ${scanMetrics.decodeP95.toFixed(0)} ms`
+                  : "—"}
+              </b>
+              decode p50 / p95
+            </span>
+          </div>
           <div className="scan-diagnostics" aria-live="polite">
             <span><b>{qrReads}</b> QR reads</span>
             <span><b>{frames}</b> unique</span>
@@ -595,9 +773,9 @@ export function ScannerClient() {
       </section>
 
       <section className="scan-tips">
-        <div><span>1</span><p>Use Turbo when a single QR stays sharp and nearly fills the guide.</p></div>
-        <div><span>2</span><p>The rate shown is measured from unique camera-decoded symbols.</p></div>
-        <div><span>3</span><p>If the missed counter climbs faster than unique reads, step down one mode.</p></div>
+        <div><span>1</span><p>Start with Turbo 15, then try 30 or 60 when the QR stays sharp and nearly fills the guide.</p></div>
+        <div><span>2</span><p>Delivered is the camera path; scanner is how quickly this phone finishes decoding exposures.</p></div>
+        <div><span>3</span><p>If scanner fps or unique reads lag the sender, step down one speed mode.</p></div>
       </section>
     </main>
   );
