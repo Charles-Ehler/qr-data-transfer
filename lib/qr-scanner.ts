@@ -26,6 +26,15 @@ export async function scanRawQr(
   image: ImageData,
   robust: boolean,
 ): Promise<Uint8Array | null> {
+  const results = await scanRawQrs(image, robust, 1);
+  return results[0] ?? null;
+}
+
+export async function scanRawQrs(
+  image: ImageData,
+  robust: boolean,
+  maxNumberOfSymbols = 2,
+): Promise<Uint8Array[]> {
   await prepareQrScanner();
   const results = await readBarcodes(image, {
     formats: ["QRCode"],
@@ -35,14 +44,15 @@ export async function scanRawQr(
     tryDownscale: false,
     tryDenoise: false,
     binarizer: robust ? "LocalAverage" : "GlobalHistogram",
-    maxNumberOfSymbols: 1,
+    maxNumberOfSymbols,
     textMode: "Plain",
   });
-  const result = results.find(
-    (candidate) =>
+  return results
+    .filter(
+      (candidate) =>
       candidate.isValid &&
       candidate.symbology === "QRCode" &&
       candidate.bytes.length > 0,
-  );
-  return result ? new Uint8Array(result.bytes) : null;
+    )
+    .map((candidate) => new Uint8Array(candidate.bytes));
 }

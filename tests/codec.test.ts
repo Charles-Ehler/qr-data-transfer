@@ -233,6 +233,114 @@ test("the actual Turbo and 1 Mbps QR profiles survive the ZXing scanner", async 
   }
 });
 
+test("ZXing recovers two noisy side-by-side Turbo lanes in one exposure", async () => {
+  await prepareZXing();
+  const preset = TRANSFER_PRESETS.turbo60;
+  const packets = [
+    deterministicBytes(preset.qrCapacity),
+    deterministicBytes(preset.qrCapacity),
+  ];
+  packets[1][0] ^= 0x5a;
+  const matrices = await Promise.all(
+    packets.map((packet) =>
+      encodeQRCodeMatrix(packet, preset.version, preset.ecc),
+    ),
+  );
+  const quietZone = 4;
+  const scale = 5;
+  const side = (matrices[0].length + quietZone * 2) * scale;
+  const width = side * 2;
+  const rgba = new Uint8ClampedArray(width * side * 4);
+  const random = seededRandom(0x2d30);
+
+  for (let y = 0; y < side; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const lane = x < side ? 0 : 1;
+      const laneX = x - lane * side;
+      const moduleX = Math.floor(laneX / scale) - quietZone;
+      const moduleY = Math.floor(y / scale) - quietZone;
+      const matrix = matrices[lane];
+      const dark =
+        moduleX >= 0 &&
+        moduleY >= 0 &&
+        moduleX < matrix.length &&
+        moduleY < matrix.length &&
+        matrix[moduleY][moduleX];
+      const noise = Math.floor(random() * 25);
+      const value = dark ? noise : 255 - noise;
+      const offset = (y * width + x) * 4;
+      rgba[offset] = value;
+      rgba[offset + 1] = value;
+      rgba[offset + 2] = value;
+      rgba[offset + 3] = 255;
+    }
+  }
+
+  const results = await readBarcodes(
+    new TestImageData(rgba, width, side) as unknown as ImageData,
+    {
+      formats: ["QRCode"],
+      tryHarder: true,
+      tryRotate: false,
+      tryInvert: false,
+      maxNumberOfSymbols: 2,
+    },
+  );
+  const expected = packets
+    .map((packet) => Buffer.from(packet).toString("hex"))
+    .sort();
+  const actual = results
+    .filter((result) => result.isValid)
+    .map((result) => Buffer.from(result.bytes).toString("hex"))
+    .sort();
+  assert.deepEqual(actual, expected);
+
+  const replacementPacket = deterministicBytes(preset.qrCapacity);
+  replacementPacket[1] ^= 0xa5;
+  const replacementMatrix = await encodeQRCodeMatrix(
+    replacementPacket,
+    preset.version,
+    preset.ecc,
+  );
+  for (let y = Math.floor(side / 2); y < side; y += 1) {
+    for (let x = 0; x < side; x += 1) {
+      const moduleX = Math.floor(x / scale) - quietZone;
+      const moduleY = Math.floor(y / scale) - quietZone;
+      const dark =
+        moduleX >= 0 &&
+        moduleY >= 0 &&
+        moduleX < replacementMatrix.length &&
+        moduleY < replacementMatrix.length &&
+        replacementMatrix[moduleY][moduleX];
+      const noise = Math.floor(random() * 25);
+      const value = dark ? noise : 255 - noise;
+      const offset = (y * width + x) * 4;
+      rgba[offset] = value;
+      rgba[offset + 1] = value;
+      rgba[offset + 2] = value;
+    }
+  }
+  const mixedResults = await readBarcodes(
+    new TestImageData(rgba, width, side) as unknown as ImageData,
+    {
+      formats: ["QRCode"],
+      tryHarder: true,
+      tryRotate: false,
+      tryInvert: false,
+      maxNumberOfSymbols: 2,
+    },
+  );
+  const stableLane = Buffer.from(packets[1]).toString("hex");
+  assert.ok(
+    mixedResults.some(
+      (result) =>
+        result.isValid &&
+        Buffer.from(result.bytes).toString("hex") === stableLane,
+    ),
+    "the unchanged lane should survive a rolling-shutter transition in its neighbor",
+  );
+});
+
 test("all profiles fit exactly and expose increasing high-speed channels", () => {
   for (const preset of Object.values(TRANSFER_PRESETS)) {
     assert.equal(
@@ -244,9 +352,12 @@ test("all profiles fit exactly and expose increasing high-speed channels", () =>
   assert.equal(TRANSFER_PRESETS.turbo.version, 30);
   assert.equal(TRANSFER_PRESETS.turbo.fps, 15);
   assert.equal(TRANSFER_PRESETS.turbo30.fps, 30);
+  assert.equal(TRANSFER_PRESETS.turbo30.lanes, 1);
   assert.equal(TRANSFER_PRESETS.turbo60.fps, 60);
+  assert.equal(TRANSFER_PRESETS.turbo60.lanes, 2);
   assert.equal(TRANSFER_PRESETS.megabit.version, 40);
   assert.equal(TRANSFER_PRESETS.megabit.fps, 60);
+  assert.equal(TRANSFER_PRESETS.megabit.lanes, 2);
   assert.ok(
     TRANSFER_PRESETS.turbo.usefulBytesPerFrame *
       TRANSFER_PRESETS.turbo.fps >

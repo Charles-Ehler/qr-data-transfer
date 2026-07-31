@@ -11,11 +11,12 @@ to an application server.
 3. Start the QR stream and keep the complete code inside the phone's guide.
 4. Save the file when RaptorQ recovery and the whole-file checksum reach 100%.
 
-All modes use one stable QR target. Robust uses larger modules, Balanced raises
-density, and Turbo offers V30-L byte-mode symbols at 15, 30, or 60 display
-frames per second. The opt-in 1 Mbps laboratory profile uses V40-L at 60 fps
-for a nominal 1.40 Mbps optical payload channel before camera loss. It requires
-a close, steady phone with a genuine fast camera and decoder path.
+Robust through Turbo 30 use one stable QR target. Turbo 60 uses two V30-L
+lanes, updating them alternately at 30 fps each so one remains stable during
+every display transition. The opt-in 1 Mbps laboratory profile uses the same
+dual-lane design with V40-L for a nominal 1.40 Mbps optical payload channel
+before camera loss. Dual modes require fullscreen sender playback, the
+receiver's Dual lane option, and a landscape phone held close and steady.
 
 ## Protocol
 
@@ -30,13 +31,15 @@ a close, steady phone with a genuine fast camera and decoder path.
   discard blur, accept frames out of order, and reconstruct after receiving
   enough unique symbols.
 - Turbo 15 uses one V30-L code held for four refreshes on a 60 Hz screen.
-  Turbo 30 and Turbo 60 are explicit opt-in profiles for faster devices. The
-  1 Mbps laboratory profile uses a denser V40-L code.
+  Turbo 30 holds one code for two refreshes. Turbo 60 alternates updates across
+  two V30-L lanes, so each lane remains stable for two refreshes while their
+  combined stream carries 60 symbols per second. The 1 Mbps laboratory profile
+  applies the same scheme to two denser V40-L lanes.
 - Playback is synchronized to browser display refreshes. The sender reports its
   measured render rate; the receiver reports negotiated and delivered camera
   fps, completed scans per second, and decoder p50/p95 latency.
-- A stable finder geometry is more reliable than asking the camera to acquire
-  four independent codes per exposure.
+- Dual scanning acquires at most two codes per exposure and accepts either
+  stable lane; it avoids the density and acquisition cost of a four-code grid.
 - Rendering uses `fast_qr` compiled to WebAssembly. Scanning uses ZXing-C++
   compiled to WebAssembly. Fountain encoding and decoding use the RFC 6330
   RaptorQ implementation compiled to WebAssembly.

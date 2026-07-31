@@ -34,7 +34,7 @@ test("server-renders the sender product surface", async () => {
   assert.match(html, /Start QR stream/);
   assert.match(html, /Brotli-11 \+ gzip-9/);
   assert.match(html, /RaptorQ FEC/);
-  assert.match(html, /Every mode uses one stable target/);
+  assert.match(html, /dual modes alternate two stable lanes/i);
   assert.match(html, /Turbo 30/);
   assert.match(html, /1 Mbps/);
   assert.doesNotMatch(html, /codex-preview|loading skeleton/i);
@@ -50,6 +50,7 @@ test("server-renders the mobile scanner surface", async () => {
   assert.match(html, /Start camera/);
   assert.match(html, /File recovery progress/);
   assert.match(html, /Effective file rate/);
+  assert.match(html, /Dual lane/);
   assert.match(html, /decode p50 \/ p95/i);
-  assert.match(html, /one raw-binary QR per exposure/);
+  assert.match(html, /one raw-binary QR per exposure|Dual-lane scanning/);
 });

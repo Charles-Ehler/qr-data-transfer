@@ -19,6 +19,7 @@ type ScanState =
   | "receiving"
   | "complete"
   | "error";
+type ScanMode = "single" | "dual";
 type RateSample = { at: number; bytes: number };
 type RaptorDecoder = { push(payload: Uint8Array): Uint8Array | null };
 type ReceiverSession = {
@@ -82,6 +83,7 @@ function percentile(values: number[], fraction: number) {
 export function ScannerClient() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const scanModeRef = useRef<ScanMode>("single");
   const streamRef = useRef<MediaStream | undefined>(undefined);
   const receiverRef = useRef<ReceiverSession | undefined>(undefined);
   const scanningRef = useRef(false);
@@ -99,6 +101,7 @@ export function ScannerClient() {
   const lastPresentedFramesRef = useRef(0);
   const lastMetricsUpdateRef = useRef(0);
   const [state, setState] = useState<ScanState>("idle");
+  const [scanMode, setScanMode] = useState<ScanMode>("single");
   const [progress, setProgress] = useState(0);
   const [frames, setFrames] = useState(0);
   const [qrReads, setQrReads] = useState(0);
@@ -127,6 +130,16 @@ export function ScannerClient() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = undefined;
   }, []);
+
+  const chooseScanMode = (nextMode: ScanMode) => {
+    scanModeRef.current = nextMode;
+    setScanMode(nextMode);
+    setGuidance(
+      nextMode === "dual"
+        ? "Rotate the phone landscape and fit both complete QRs inside the guide."
+        : "Center the complete QR inside the four corners.",
+    );
+  };
 
   const finishTransfer = useCallback(
     async (container: Uint8Array, session: ReceiverSession) => {
@@ -311,20 +324,41 @@ export function ScannerClient() {
           return;
         }
 
-        const sourceSize = Math.floor(
-          Math.min(video.videoWidth, video.videoHeight) * 0.96,
+        const dualMode = scanModeRef.current === "dual";
+        const availableWidth = video.videoWidth * 0.96;
+        const availableHeight = video.videoHeight * 0.96;
+        const sourceWidth = Math.floor(
+          dualMode
+            ? Math.min(availableWidth, availableHeight * 2)
+            : Math.min(availableWidth, availableHeight),
         );
-        const sourceX = Math.floor((video.videoWidth - sourceSize) / 2);
-        const sourceY = Math.floor((video.videoHeight - sourceSize) / 2);
+        const sourceHeight = dualMode
+          ? Math.floor(sourceWidth / 2)
+          : sourceWidth;
+        const sourceX = Math.floor((video.videoWidth - sourceWidth) / 2);
+        const sourceY = Math.floor((video.videoHeight - sourceHeight) / 2);
         const robustAttempt = decodeFailuresRef.current % 6 === 5;
         const highDensity =
           (receiverRef.current?.symbolSize ?? 0) > 2200;
-        const scanSize = Math.min(
-          highDensity ? 1280 : robustAttempt ? 1120 : 960,
-          sourceSize,
+        const scanWidth = Math.min(
+          dualMode
+            ? highDensity
+              ? 1800
+              : robustAttempt
+                ? 1680
+                : 1440
+            : highDensity
+              ? 1280
+              : robustAttempt
+                ? 1120
+                : 960,
+          sourceWidth,
         );
-        canvas.width = scanSize;
-        canvas.height = scanSize;
+        const scanHeight = dualMode
+          ? Math.max(1, Math.floor(scanWidth / 2))
+          : scanWidth;
+        canvas.width = scanWidth;
+        canvas.height = scanHeight;
         const context = canvas.getContext("2d", { willReadFrequently: true });
         if (!context) return;
         context.imageSmoothingEnabled = false;
@@ -332,26 +366,31 @@ export function ScannerClient() {
           video,
           sourceX,
           sourceY,
-          sourceSize,
-          sourceSize,
+          sourceWidth,
+          sourceHeight,
           0,
           0,
-          scanSize,
-          scanSize,
+          scanWidth,
+          scanHeight,
         );
 
-        const image = context.getImageData(0, 0, scanSize, scanSize);
-        const { scanRawQr } = await import("@/lib/qr-scanner");
+        const image = context.getImageData(0, 0, scanWidth, scanHeight);
+        const { scanRawQr, scanRawQrs } = await import("@/lib/qr-scanner");
         attempted = true;
         const decodeStartedAt = performance.now();
-        let decoded: Uint8Array | null;
+        let decodedFrames: Uint8Array[];
         try {
-          decoded = await scanRawQr(image, robustAttempt);
+          if (dualMode) {
+            decodedFrames = await scanRawQrs(image, robustAttempt, 2);
+          } else {
+            const decoded = await scanRawQr(image, robustAttempt);
+            decodedFrames = decoded ? [decoded] : [];
+          }
         } finally {
           decodeMs = performance.now() - decodeStartedAt;
         }
 
-        if (!decoded) {
+        if (decodedFrames.length === 0) {
           decodeFailuresRef.current += 1;
           missedExposuresRef.current += 1;
           if (missedExposuresRef.current % 5 === 0) {
@@ -360,7 +399,9 @@ export function ScannerClient() {
           return;
         }
         decodeFailuresRef.current = 0;
-        await acceptQrBytes(decoded);
+        for (const decoded of decodedFrames) {
+          await acceptQrBytes(decoded);
+        }
       };
 
       void runScan()
@@ -431,7 +472,11 @@ export function ScannerClient() {
 
   const startCamera = useCallback(async () => {
     setError("");
-    setGuidance("Center the complete QR inside the four corners.");
+    setGuidance(
+      scanModeRef.current === "dual"
+        ? "Rotate the phone landscape and fit both complete QRs inside the guide."
+        : "Center the complete QR inside the four corners.",
+    );
     setState("starting");
     receiverRef.current = undefined;
     completingRef.current = false;
@@ -549,9 +594,17 @@ export function ScannerClient() {
       if (lastQrAtRef.current > 0 && now - lastQrAtRef.current < 3000) return;
       const elapsed = now - scanStartedAtRef.current;
       if (elapsed > 8000) {
-        setGuidance("No frame decoded. Use Robust mode, move closer, and keep the white margin visible.");
+        setGuidance(
+          scanModeRef.current === "dual"
+            ? "No lane decoded. Confirm Dual lane on both devices, rotate landscape, and move closer."
+            : "No frame decoded. Use Robust mode, move closer, and keep the white margin visible.",
+        );
       } else if (elapsed > 4000) {
-        setGuidance("Still looking. Move closer until the single QR nearly fills the guide.");
+        setGuidance(
+          scanModeRef.current === "dual"
+            ? "Still looking. Keep both white margins visible and hold the phone square to the screen."
+            : "Still looking. Move closer until the single QR nearly fills the guide.",
+        );
       }
     }, 1000);
     return () => window.clearInterval(timer);
@@ -600,12 +653,14 @@ export function ScannerClient() {
         <p>
           {complete
             ? "The RaptorQ object and original file both passed end-to-end checksums."
-            : "A native-speed scanner reads one raw-binary QR per exposure; missed frames do not matter."}
+            : scanMode === "dual"
+              ? "Dual-lane scanning reads two alternating 30 fps channels; either stable lane can advance the file."
+              : "A native-speed scanner reads one raw-binary QR per exposure; missed frames do not matter."}
         </p>
       </section>
 
       <section className="scanner-shell">
-        <div className={`camera-view ${active ? "active" : ""} ${complete ? "complete" : ""}`}>
+        <div className={`camera-view ${scanMode} ${active ? "active" : ""} ${complete ? "complete" : ""}`}>
           <video ref={videoRef} playsInline muted aria-label="Rear camera preview" />
           <canvas ref={canvasRef} hidden />
           <div className="scan-reticle" aria-hidden="true">
@@ -615,7 +670,11 @@ export function ScannerClient() {
             <div className="camera-empty">
               <span className="camera-icon" aria-hidden="true">◎</span>
               <strong>Camera is off</strong>
-              <span>The video stays on this device.</span>
+              <span>
+                {scanMode === "dual"
+                  ? "Dual lane selected · rotate landscape."
+                  : "The video stays on this device."}
+              </span>
             </div>
           ) : null}
           {state === "starting" ? <div className="camera-loading">Loading optical decoder…</div> : null}
@@ -650,6 +709,35 @@ export function ScannerClient() {
             aria-valuenow={Math.round(progress * 100)}
           >
             <span style={{ width: `${progress * 100}%` }} />
+          </div>
+
+          <div
+            className="scan-mode-picker"
+            role="radiogroup"
+            aria-label="Scanner layout"
+          >
+            <button
+              type="button"
+              role="radio"
+              aria-checked={scanMode === "single"}
+              className={scanMode === "single" ? "selected" : ""}
+              disabled={active}
+              onClick={() => chooseScanMode("single")}
+            >
+              Single QR
+              <small>Robust through Turbo 30</small>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={scanMode === "dual"}
+              className={scanMode === "dual" ? "selected" : ""}
+              disabled={active}
+              onClick={() => chooseScanMode("dual")}
+            >
+              Dual lane
+              <small>Turbo 60 and 1 Mbps lab</small>
+            </button>
           </div>
 
           <div className="rate-panel" aria-live="polite">
@@ -773,9 +861,9 @@ export function ScannerClient() {
       </section>
 
       <section className="scan-tips">
-        <div><span>1</span><p>Start with Turbo 15, then try 30 or 60 when the QR stays sharp and nearly fills the guide.</p></div>
-        <div><span>2</span><p>Delivered is the camera path; scanner is how quickly this phone finishes decoding exposures.</p></div>
-        <div><span>3</span><p>If scanner fps or unique reads lag the sender, step down one speed mode.</p></div>
+        <div><span>1</span><p>Turbo 60 requires Dual lane on the reader and a landscape phone view containing both complete QRs.</p></div>
+        <div><span>2</span><p>Only one lane changes per refresh, leaving the other clean through rolling-shutter transitions.</p></div>
+        <div><span>3</span><p>If neither lane locks, use fullscreen, move closer, or return to single-lane Turbo 30.</p></div>
       </section>
     </main>
   );

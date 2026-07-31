@@ -63,7 +63,7 @@ function estimateDuration(
 
 export function SendClient() {
   const inputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRefs = useRef<Array<HTMLCanvasElement | null>>([]);
   const qrStageRef = useRef<HTMLDivElement>(null);
   const transferRef = useRef<OpticalTransfer | undefined>(undefined);
   const orderRef = useRef<number[]>([]);
@@ -174,8 +174,9 @@ export function SendClient() {
       target: OpticalTransfer,
       packetIndex: number,
       activePreset: (typeof TRANSFER_PRESETS)[TransferPresetKey],
+      laneIndex = 0,
     ) => {
-      const canvas = canvasRef.current;
+      const canvas = canvasRefs.current[laneIndex];
       if (!canvas) return;
       const { renderRawQr } = await import("@/lib/qr-renderer");
       const image = await renderRawQr(
@@ -195,9 +196,16 @@ export function SendClient() {
 
   useEffect(() => {
     if (!transfer || orderRef.current.length === 0) return;
-    void renderPacket(transfer, orderRef.current[0], preset).catch(() =>
-      setError("The QR preview could not be rendered."),
-    );
+    void Promise.all(
+      Array.from({ length: preset.lanes }, (_, laneIndex) =>
+        renderPacket(
+          transfer,
+          orderRef.current[laneIndex % orderRef.current.length],
+          preset,
+          laneIndex,
+        ),
+      ),
+    ).catch(() => setError("The QR preview could not be rendered."));
   }, [preset, renderPacket, transfer]);
 
   useEffect(() => {
@@ -217,8 +225,9 @@ export function SendClient() {
       const order = orderRef.current;
       if (!activeTransfer || order.length === 0 || cancelled) return;
       const packetIndex = order[playedFramesRef.current % order.length];
+      const laneIndex = playedFramesRef.current % preset.lanes;
       try {
-        await renderPacket(activeTransfer, packetIndex, preset);
+        await renderPacket(activeTransfer, packetIndex, preset, laneIndex);
       } catch {
         setError("QR rendering paused after an unexpected error.");
         setPlaying(false);
@@ -406,7 +415,7 @@ export function SendClient() {
             <span>02</span>
             <div>
               <h2>Tune the channel</h2>
-              <p>Every mode uses one stable target; density and pace change.</p>
+              <p>Robust modes use one target; dual modes alternate two stable lanes.</p>
             </div>
           </div>
 
@@ -428,7 +437,10 @@ export function SendClient() {
                     <small>{option.description}</small>
                   </span>
                   <b>
-                    {option.fps} fps ·{" "}
+                    {option.lanes === 1
+                      ? `${option.fps} fps`
+                      : `${option.fps} symbols/s · ${option.fps / option.lanes} fps/lane`}
+                    {" · "}
                     {formatRate(option.usefulBytesPerFrame * option.fps)}
                   </b>
                 </button>
@@ -438,8 +450,8 @@ export function SendClient() {
 
           {preset.fps >= 30 ? (
             <p className="channel-warning">
-              {presetKey === "megabit"
-                ? "Laboratory mode: make the QR fullscreen and let it nearly fill a sharp 60 fps camera frame."
+              {preset.lanes === 2
+                ? "Dual mode: use fullscreen, rotate the phone landscape, and select Dual lane on the scanner."
                 : "Fast mode: watch the receiver’s delivered and scanner rates. Step down if valid unique reads stop increasing."}
             </p>
           ) : null}
@@ -452,20 +464,33 @@ export function SendClient() {
             <span>03</span>
             <div>
               <h2>Play the QR stream</h2>
-              <p>Fill the phone guide with this one complete code.</p>
+              <p>
+                {preset.lanes === 2
+                  ? "Keep both complete codes inside the landscape phone guide."
+                  : "Fill the phone guide with this one complete code."}
+              </p>
             </div>
           </div>
 
           <div
             ref={qrStageRef}
-            className={`qr-stage ${transfer ? "ready" : ""} ${playing ? "playing" : ""} lanes-1`}
+            className={`qr-stage ${transfer ? "ready" : ""} ${playing ? "playing" : ""} lanes-${preset.lanes}`}
           >
             {transfer ? (
-              <div className="qr-canvas-grid lanes-1">
-                <canvas
-                  ref={canvasRef}
-                  aria-label="Animated RaptorQ file transfer"
-                />
+              <div className={`qr-canvas-grid lanes-${preset.lanes}`}>
+                {Array.from({ length: preset.lanes }, (_, laneIndex) => (
+                  <canvas
+                    key={laneIndex}
+                    ref={(canvas) => {
+                      canvasRefs.current[laneIndex] = canvas;
+                    }}
+                    aria-label={
+                      preset.lanes === 1
+                        ? "Animated RaptorQ file transfer"
+                        : `Animated RaptorQ file transfer lane ${laneIndex + 1}`
+                    }
+                  />
+                ))}
               </div>
             ) : (
               <div className="qr-placeholder" aria-hidden="true">
@@ -565,7 +590,7 @@ export function SendClient() {
           <div className="feature">
             <span>02</span>
             <h3>Raw binary QR</h3>
-            <p>Byte-mode symbols remove Base45 expansion while one stable finder geometry stays easy to track.</p>
+            <p>Byte-mode symbols remove Base45 expansion while stable finder geometry stays easy to track.</p>
           </div>
           <div className="feature">
             <span>03</span>
