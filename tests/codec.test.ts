@@ -9,6 +9,7 @@ import {
   encodeDroplet,
   FountainDecoder,
 } from "../lib/qr-transfer";
+import { TRANSFER_PRESETS } from "../lib/transfer-presets";
 
 function deterministicBytes(length: number) {
   const output = new Uint8Array(length);
@@ -62,7 +63,7 @@ test("damaged frames are rejected by the per-frame checksum", () => {
     (valid[pivot] === "A" ? "B" : "A") +
     valid.slice(pivot + 1);
 
-  assert.throws(() => decodeDroplet(damaged), /checksum|Invalid character/i);
+  assert.throws(() => decodeDroplet(damaged), /checksum|Base45|Invalid/i);
 });
 
 test("fountain repair recovers a file through drop, reorder, duplicate, and corruption loss", () => {
@@ -138,4 +139,25 @@ test("the actual QR encoder and camera decoder preserve a transfer frame", () =>
   assert.ok(scanned, "jsQR should decode the rasterized camera frame");
   assert.equal(scanned.data, text);
   assert.equal(decodeDroplet(scanned.data).sequence, 3);
+});
+
+test("every camera preset stays at QR version 19 or below with maximum metadata", () => {
+  for (const [name, preset] of Object.entries(TRANSFER_PRESETS)) {
+    const source = createTransferSource(deterministicBytes(preset.blockSize * 2), {
+      filename:
+        "an-extremely-long-desktop-filename-that-must-keep-its-important-extension.pptx",
+      mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      blockSize: preset.blockSize,
+      sessionBytes: new Uint8Array(8).fill(7),
+    });
+    const encoded = encodeDroplet(createDroplet(source, 0));
+    const qr = QRCode.create(encoded, { errorCorrectionLevel: preset.ecc });
+    const version = (qr.modules.size - 17) / 4;
+
+    assert.ok(
+      version <= 19,
+      `${name} produced QR version ${version}, which is too dense for reliable camera pickup`,
+    );
+    assert.match(source.meta.filename, /…\.pptx$/);
+  }
 });

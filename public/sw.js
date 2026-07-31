@@ -1,4 +1,4 @@
-const CACHE = "qrferry-shell-v1";
+const CACHE = "qrferry-shell-v2";
 const SHELL = ["/", "/scan", "/manifest.webmanifest", "/favicon.svg"];
 
 self.addEventListener("install", (event) => {

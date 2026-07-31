@@ -1,9 +1,10 @@
-const MAGIC = new Uint8Array([0x51, 0x52, 0x46, 0x31]); // QRF1
-const VERSION = 1;
-const PREFIX = "QRF1:";
+const MAGIC = new Uint8Array([0x51, 0x52, 0x46, 0x32]); // QRF2
+const VERSION = 2;
+const PREFIX = "QRF2:";
 const FIXED_HEADER_BYTES = 40;
 const CRC_BYTES = 4;
 const FLAG_SYSTEMATIC = 1;
+const BASE45_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
 
 export const MAX_FILE_BYTES = 512 * 1024 * 1024;
 
@@ -90,6 +91,19 @@ function truncateUtf8(value: string, maxBytes: number) {
     candidate = candidate.slice(0, -1);
   }
   return candidate;
+}
+
+function truncateFilename(value: string, maxBytes: number) {
+  if (textEncoder.encode(value).length <= maxBytes) return value;
+  const lastDot = value.lastIndexOf(".");
+  const extension =
+    lastDot > 0 && textEncoder.encode(value.slice(lastDot)).length <= 12
+      ? value.slice(lastDot)
+      : "";
+  const suffix = `…${extension}`;
+  const suffixBytes = textEncoder.encode(suffix).length;
+  const base = extension ? value.slice(0, lastDot) : value;
+  return `${truncateUtf8(base, Math.max(1, maxBytes - suffixBytes))}${suffix}`;
 }
 
 function mix32(input: number) {
@@ -193,8 +207,12 @@ export function createTransferSource(
   const sessionBytes = options.sessionBytes?.slice() ?? randomSessionBytes();
   if (sessionBytes.length !== 8) throw new Error("Session IDs must be 8 bytes.");
 
-  const filename = truncateUtf8(options.filename || "transfer.bin", 96);
-  const mime = truncateUtf8(options.mime || "application/octet-stream", 64);
+  const filename = truncateFilename(options.filename || "transfer.bin", 48);
+  const requestedMime = options.mime || "application/octet-stream";
+  const mime =
+    textEncoder.encode(requestedMime).length <= 32
+      ? requestedMime
+      : "application/octet-stream";
   const blockCount = Math.max(1, Math.ceil(bytes.length / options.blockSize));
   const blocks: Uint8Array[] = [];
 
@@ -266,22 +284,53 @@ export function createDroplet(source: TransferSource, sequence: number): Droplet
   };
 }
 
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+function bytesToBase45(bytes: Uint8Array) {
+  let encoded = "";
+  for (let index = 0; index < bytes.length; index += 2) {
+    if (index + 1 < bytes.length) {
+      let value = bytes[index] * 256 + bytes[index + 1];
+      const first = value % 45;
+      value = Math.floor(value / 45);
+      const second = value % 45;
+      const third = Math.floor(value / 45);
+      encoded +=
+        BASE45_ALPHABET[first] +
+        BASE45_ALPHABET[second] +
+        BASE45_ALPHABET[third];
+    } else {
+      const value = bytes[index];
+      encoded +=
+        BASE45_ALPHABET[value % 45] +
+        BASE45_ALPHABET[Math.floor(value / 45)];
+    }
   }
-  return btoa(binary);
+  return encoded;
 }
 
-function base64ToBytes(value: string) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
+function base45ToBytes(value: string) {
+  if (value.length % 3 === 1) throw new Error("Invalid Base45 frame length.");
+  const output: number[] = [];
+  for (let index = 0; index < value.length; ) {
+    const remaining = value.length - index;
+    const groupLength = remaining >= 3 ? 3 : 2;
+    const first = BASE45_ALPHABET.indexOf(value[index]);
+    const second = BASE45_ALPHABET.indexOf(value[index + 1]);
+    if (first < 0 || second < 0) throw new Error("Invalid Base45 character.");
+
+    if (groupLength === 3) {
+      const third = BASE45_ALPHABET.indexOf(value[index + 2]);
+      if (third < 0) throw new Error("Invalid Base45 character.");
+      const decoded = first + second * 45 + third * 45 * 45;
+      if (decoded > 0xffff) throw new Error("Invalid Base45 value.");
+      output.push(decoded >>> 8, decoded & 0xff);
+    } else {
+      const decoded = first + second * 45;
+      if (decoded > 0xff) throw new Error("Invalid Base45 value.");
+      output.push(decoded);
+    }
+    index += groupLength;
   }
-  return bytes;
+  return new Uint8Array(output);
 }
 
 export function encodeDroplet(droplet: Droplet) {
@@ -331,12 +380,12 @@ export function encodeDroplet(droplet: Droplet) {
   offset += droplet.payload.length;
   view.setUint32(offset, crc32(packet.subarray(0, offset)), true);
 
-  return PREFIX + bytesToBase64(packet);
+  return PREFIX + bytesToBase45(packet);
 }
 
 export function decodeDroplet(value: string): Droplet {
   if (!value.startsWith(PREFIX)) throw new Error("Not a QRFerry frame.");
-  const packet = base64ToBytes(value.slice(PREFIX.length));
+  const packet = base45ToBytes(value.slice(PREFIX.length));
   if (packet.length < FIXED_HEADER_BYTES + CRC_BYTES) {
     throw new Error("Truncated QRFerry frame.");
   }
@@ -576,3 +625,4 @@ export function formatBytes(bytes: number) {
 }
 
 export const FRAME_PREFIX = PREFIX;
+export const LEGACY_FRAME_PREFIX = "QRF1:";

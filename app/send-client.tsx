@@ -18,34 +18,15 @@ import {
   MAX_FILE_BYTES,
   TransferSource,
 } from "@/lib/qr-transfer";
+import {
+  TRANSFER_PRESETS,
+  TransferPresetKey,
+} from "@/lib/transfer-presets";
 
-type PresetKey = "robust" | "balanced" | "turbo";
-
-const PRESETS = {
-  robust: {
-    label: "Robust",
-    description: "For older cameras",
-    blockSize: 300,
-    fps: 6,
-    ecc: "H" as const,
-  },
-  balanced: {
-    label: "Balanced",
-    description: "Best default",
-    blockSize: 500,
-    fps: 9,
-    ecc: "Q" as const,
-  },
-  turbo: {
-    label: "Turbo",
-    description: "Bright, steady setup",
-    blockSize: 700,
-    fps: 12,
-    ecc: "M" as const,
-  },
-};
-
-function estimateDuration(source: TransferSource, preset: (typeof PRESETS)[PresetKey]) {
+function estimateDuration(
+  source: TransferSource,
+  preset: (typeof TRANSFER_PRESETS)[TransferPresetKey],
+) {
   const usefulFramesPerSecond = preset.fps * 0.68;
   const seconds = source.meta.blockCount / usefulFramesPerSecond;
   if (seconds < 60) return `about ${Math.max(1, Math.ceil(seconds))} sec`;
@@ -61,13 +42,13 @@ export function SendClient() {
   const sequenceRef = useRef(0);
   const [fileData, setFileData] = useState<{ file: File; bytes: Uint8Array }>();
   const [source, setSource] = useState<TransferSource>();
-  const [presetKey, setPresetKey] = useState<PresetKey>("balanced");
+  const [presetKey, setPresetKey] = useState<TransferPresetKey>("robust");
   const [playing, setPlaying] = useState(false);
   const [frameNumber, setFrameNumber] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const preset = PRESETS[presetKey];
+  const preset = TRANSFER_PRESETS[presetKey];
 
   useEffect(() => {
     sourceRef.current = source;
@@ -100,11 +81,11 @@ export function SendClient() {
     [preset.blockSize],
   );
 
-  const changePreset = (nextKey: PresetKey) => {
+  const changePreset = (nextKey: TransferPresetKey) => {
     setPresetKey(nextKey);
     setPlaying(false);
     if (fileData) {
-      const next = PRESETS[nextKey];
+      const next = TRANSFER_PRESETS[nextKey];
       const nextSource = createTransferSource(fileData.bytes, {
         filename: fileData.file.name,
         mime: fileData.file.type || "application/octet-stream",
@@ -122,11 +103,11 @@ export function SendClient() {
       if (!canvasRef.current) return;
       const encoded = encodeDroplet(createDroplet(target, sequence));
       await QRCode.toCanvas(canvasRef.current, encoded, {
-        width: 720,
-        margin: 4,
+        width: 900,
+        margin: 6,
         errorCorrectionLevel: preset.ecc,
         color: {
-          dark: "#111820",
+          dark: "#000000",
           light: "#ffffff",
         },
       });
@@ -277,13 +258,13 @@ export function SendClient() {
             <span>02</span>
             <div>
               <h2>Tune the signal</h2>
-              <p>Start balanced; slow down for difficult cameras.</p>
+              <p>Start Robust. Move up only after the phone reads frames.</p>
             </div>
           </div>
 
           <div className="preset-list" role="radiogroup" aria-label="Signal preset">
-            {(Object.keys(PRESETS) as PresetKey[]).map((key) => {
-              const option = PRESETS[key];
+            {(Object.keys(TRANSFER_PRESETS) as TransferPresetKey[]).map((key) => {
+              const option = TRANSFER_PRESETS[key];
               return (
                 <button
                   type="button"

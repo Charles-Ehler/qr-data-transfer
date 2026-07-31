@@ -927,14 +927,46 @@ input:focus-visible {
   font-size: 9px;
 }
 
+.scan-diagnostics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  margin-bottom: 10px;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+
+.scan-diagnostics span {
+  min-width: 0;
+  padding: 9px 6px;
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  background: #f7f6f2;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.scan-diagnostics b {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .scan-hint {
   min-height: 47px;
   margin: 0 0 18px;
+  padding: 10px 14px;
   display: grid;
   place-items: center;
   border: 1px dashed var(--line);
   color: var(--muted);
   font-size: 11px;
+  line-height: 1.45;
   text-align: center;
 }
 
@@ -1122,6 +1154,10 @@ input:focus-visible {
 
   .receive-card {
     padding: 22px 18px;
+  }
+
+  .scan-diagnostics {
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .scan-tips {

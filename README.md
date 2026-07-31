@@ -11,13 +11,15 @@ to an application server.
 3. Start the QR stream and keep the complete code inside the phone's guide.
 4. Save the file when recovery and the whole-file checksum reach 100%.
 
-Balanced mode is the best default. Robust mode uses larger QR modules and
-stronger per-frame correction for older cameras, glare, or handheld movement.
-Turbo mode raises the payload and frame rate for bright, steady setups.
+Robust mode is the default and uses larger QR modules, longer frame holds, and
+stronger per-frame correction. Once the scanner reports accepted frames,
+Balanced or Turbo can raise throughput for a bright, steady setup.
 
 ## Resilience model
 
 - Each QR uses native QR error correction to survive local image damage.
+- A Base45 wire envelope keeps frames in QR's compact alphanumeric mode; every
+  preset is capped at QR version 19 even with maximum repeated metadata.
 - Each binary frame has a CRC-32 checksum; corrupt frames are discarded.
 - The stream begins with systematic source blocks for fast clean transfers.
 - It then emits an unlimited robust-soliton fountain stream. Any sufficient set

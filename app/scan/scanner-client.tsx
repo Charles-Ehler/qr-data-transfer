@@ -7,26 +7,52 @@ import {
   FountainDecoder,
   formatBytes,
   FRAME_PREFIX,
+  LEGACY_FRAME_PREFIX,
   TransferMeta,
 } from "@/lib/qr-transfer";
 
 type ScanState = "idle" | "starting" | "scanning" | "receiving" | "complete" | "error";
+type DetectorMode = "native" | "software";
+type DetectedBarcode = { rawValue?: string };
+type NativeBarcodeDetector = {
+  detect(source: CanvasImageSource): Promise<DetectedBarcode[]>;
+};
+type BarcodeDetectorConstructor = {
+  new (options: { formats: string[] }): NativeBarcodeDetector;
+  getSupportedFormats?: () => Promise<string[]>;
+};
+
+function getBarcodeDetectorConstructor() {
+  return (
+    globalThis as typeof globalThis & {
+      BarcodeDetector?: BarcodeDetectorConstructor;
+    }
+  ).BarcodeDetector;
+}
 
 export function ScannerClient() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | undefined>(undefined);
+  const detectorRef = useRef<NativeBarcodeDetector | undefined>(undefined);
   const decoderRef = useRef(new FountainDecoder());
   const scanningRef = useRef(false);
-  const lastFrameAtRef = useRef(0);
   const downloadUrlRef = useRef("");
+  const scanStartedAtRef = useRef(0);
+  const lastQrAtRef = useRef(0);
+  const qrReadsRef = useRef(0);
+  const acceptedFramesRef = useRef(0);
   const [state, setState] = useState<ScanState>("idle");
   const [progress, setProgress] = useState(0);
   const [solved, setSolved] = useState(0);
   const [frames, setFrames] = useState(0);
+  const [qrReads, setQrReads] = useState(0);
+  const [badFrames, setBadFrames] = useState(0);
   const [meta, setMeta] = useState<TransferMeta>();
   const [downloadUrl, setDownloadUrl] = useState("");
   const [error, setError] = useState("");
+  const [guidance, setGuidance] = useState("Center the entire QR inside the four corners.");
+  const [detectorMode, setDetectorMode] = useState<DetectorMode>("software");
   const [torchAvailable, setTorchAvailable] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
 
@@ -45,65 +71,149 @@ export function ScannerClient() {
     downloadUrlRef.current = url;
     setDownloadUrl(url);
     setProgress(1);
+    setGuidance("File checksum verified. It is safe to save.");
     setState("complete");
     stopCamera();
     navigator.vibrate?.([80, 40, 120]);
   }, [stopCamera]);
 
-  const scanVideo = useCallback(function scanVideoFrame() {
-    if (!scanningRef.current) return;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (video && canvas && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      const now = performance.now();
-      if (now - lastFrameAtRef.current >= 70) {
-        lastFrameAtRef.current = now;
-        const maxDimension = 960;
-        const scale = Math.min(1, maxDimension / Math.max(video.videoWidth, video.videoHeight));
-        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+  const acceptQrValue = useCallback(
+    (value: string) => {
+      qrReadsRef.current += 1;
+      lastQrAtRef.current = performance.now();
+      setQrReads(qrReadsRef.current);
+
+      if (value.startsWith(LEGACY_FRAME_PREFIX)) {
+        setGuidance("An older QRFerry sender is visible. Reload the sending screen, then restart its stream.");
+        return;
+      }
+      if (!value.startsWith(FRAME_PREFIX)) {
+        setGuidance("A QR code is visible, but it is not a QRFerry transfer.");
+        return;
+      }
+
+      try {
+        const droplet = decodeDroplet(value);
+        const result = decoderRef.current.receive(droplet);
+        if (result.accepted) {
+          acceptedFramesRef.current += 1;
+          setMeta(droplet.meta);
+          setFrames(acceptedFramesRef.current);
+          setSolved(result.solved);
+          setProgress(result.total ? result.solved / result.total : 0);
+          setGuidance(
+            result.solved === 0
+              ? "QR locked. Keep the phone steady while repair frames arrive."
+              : "Signal locked. Keep the full QR inside the corners.",
+          );
+          setState(result.complete ? "complete" : "receiving");
+          if (result.complete) finishTransfer();
+        } else if (result.duplicate) {
+          setGuidance("QR locked. Waiting for the sending screen to advance.");
+        }
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : "";
+        setBadFrames((current) => current + 1);
+        setGuidance("QR found, but this frame was blurred. Hold steady—the next one can replace it.");
+        if (message.includes("different transfer")) setError(message);
+      }
+    },
+    [finishTransfer],
+  );
+
+  const scanVideo = useCallback(
+    function scanVideoFrame() {
+      if (!scanningRef.current) return;
+
+      const runScan = async () => {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        if (
+          !video ||
+          !canvas ||
+          video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+          video.videoWidth === 0 ||
+          video.videoHeight === 0
+        ) {
+          return;
+        }
+
+        // The on-screen reticle is square. Cropping to the matching central
+        // camera region makes each QR module substantially larger for decoders.
+        const sourceSize = Math.floor(Math.min(video.videoWidth, video.videoHeight) * 0.94);
+        const sourceX = Math.floor((video.videoWidth - sourceSize) / 2);
+        const sourceY = Math.floor((video.videoHeight - sourceSize) / 2);
+        const scanSize = Math.min(800, sourceSize);
+        canvas.width = scanSize;
+        canvas.height = scanSize;
         const context = canvas.getContext("2d", { willReadFrequently: true });
-        if (context) {
-          context.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const image = context.getImageData(0, 0, canvas.width, canvas.height);
-          const code = jsQR(image.data, image.width, image.height, {
-            inversionAttempts: "dontInvert",
-          });
-          if (code?.data.startsWith(FRAME_PREFIX)) {
-            try {
-              const droplet = decodeDroplet(code.data);
-              const result = decoderRef.current.receive(droplet);
-              if (result.accepted) {
-                setMeta(droplet.meta);
-                setFrames((current) => current + 1);
-                setSolved(result.solved);
-                setProgress(result.total ? result.solved / result.total : 0);
-                setState(result.complete ? "complete" : "receiving");
-                if (result.complete) {
-                  finishTransfer();
-                  return;
-                }
+        if (!context) return;
+        context.drawImage(
+          video,
+          sourceX,
+          sourceY,
+          sourceSize,
+          sourceSize,
+          0,
+          0,
+          scanSize,
+          scanSize,
+        );
+
+        let nativeRead = false;
+        if (detectorRef.current) {
+          try {
+            const barcodes = await detectorRef.current.detect(canvas);
+            for (const barcode of barcodes) {
+              if (barcode.rawValue) {
+                nativeRead = true;
+                acceptQrValue(barcode.rawValue);
+                break;
               }
-            } catch (cause) {
-              const message = cause instanceof Error ? cause.message : "";
-              if (message.includes("different transfer")) setError(message);
-              // Bad checksums and partial camera reads are expected and ignored.
             }
+          } catch {
+            detectorRef.current = undefined;
+            setDetectorMode("software");
           }
         }
-      }
-    }
-    window.requestAnimationFrame(scanVideoFrame);
-  }, [finishTransfer]);
+
+        if (!nativeRead) {
+          const image = context.getImageData(0, 0, scanSize, scanSize);
+          const code = jsQR(image.data, image.width, image.height, {
+            inversionAttempts: "attemptBoth",
+          });
+          if (code?.data) acceptQrValue(code.data);
+        }
+      };
+
+      void runScan().finally(() => {
+        if (scanningRef.current) {
+          window.setTimeout(
+            () => window.requestAnimationFrame(scanVideoFrame),
+            35,
+          );
+        }
+      });
+    },
+    [acceptQrValue],
+  );
 
   const startCamera = useCallback(async () => {
     setError("");
+    setGuidance("Center the entire QR inside the four corners.");
     setState("starting");
     decoderRef.current = new FountainDecoder();
+    qrReadsRef.current = 0;
+    acceptedFramesRef.current = 0;
+    lastQrAtRef.current = 0;
+    scanStartedAtRef.current = performance.now();
     setMeta(undefined);
     setProgress(0);
     setSolved(0);
     setFrames(0);
+    setQrReads(0);
+    setBadFrames(0);
+    setTorchOn(false);
     if (downloadUrlRef.current) {
       URL.revokeObjectURL(downloadUrlRef.current);
       downloadUrlRef.current = "";
@@ -111,21 +221,38 @@ export function ScannerClient() {
     }
 
     try {
+      const Detector = getBarcodeDetectorConstructor();
+      if (Detector) {
+        const formats = await Detector.getSupportedFormats?.();
+        if (!formats || formats.includes("qr_code")) {
+          detectorRef.current = new Detector({ formats: ["qr_code"] });
+          setDetectorMode("native");
+        }
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
           frameRate: { ideal: 30 },
         },
       });
       streamRef.current = stream;
       const track = stream.getVideoTracks()[0];
       const capabilities = track.getCapabilities?.() as MediaTrackCapabilities & {
+        focusMode?: string[];
         torch?: boolean;
       };
       setTorchAvailable(Boolean(capabilities?.torch));
+      if (capabilities?.focusMode?.includes("continuous")) {
+        await track
+          .applyConstraints({
+            advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet],
+          })
+          .catch(() => undefined);
+      }
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
@@ -156,6 +283,21 @@ export function ScannerClient() {
       setTorchAvailable(false);
     }
   };
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!scanningRef.current || acceptedFramesRef.current > 0) return;
+      const now = performance.now();
+      if (lastQrAtRef.current > 0 && now - lastQrAtRef.current < 3000) return;
+      const elapsed = now - scanStartedAtRef.current;
+      if (elapsed > 8000) {
+        setGuidance("No QR detected. Use Robust mode, move closer, and keep all four white margins visible.");
+      } else if (elapsed > 4000) {
+        setGuidance("Still looking. Move closer until the QR nearly fills the guide.");
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -197,9 +339,7 @@ export function ScannerClient() {
             </div>
           ) : null}
           {state === "starting" ? <div className="camera-loading">Starting camera…</div> : null}
-          {complete ? (
-            <div className="complete-mark" aria-hidden="true">✓</div>
-          ) : null}
+          {complete ? <div className="complete-mark" aria-hidden="true">✓</div> : null}
           {torchAvailable && active ? (
             <button className="torch-button" type="button" onClick={toggleTorch}>
               {torchOn ? "Light off" : "Light on"}
@@ -243,9 +383,15 @@ export function ScannerClient() {
               </div>
               <b>{frames}</b>
             </div>
-          ) : (
-            <p className="scan-hint">Use the rear camera 20–60 cm from the sending screen.</p>
-          )}
+          ) : null}
+
+          <div className="scan-diagnostics" aria-live="polite">
+            <span><b>{qrReads}</b> QR reads</span>
+            <span><b>{frames}</b> accepted</span>
+            <span><b>{badFrames}</b> blurred</span>
+            <span><b>{detectorMode}</b> detector</span>
+          </div>
+          <p className="scan-hint">{guidance}</p>
 
           {error ? <p className="error-message" role="alert">{error}</p> : null}
 
@@ -259,7 +405,15 @@ export function ScannerClient() {
               className="primary-action"
               type="button"
               disabled={state === "starting"}
-              onClick={active ? stopCamera : startCamera}
+              onClick={
+                active
+                  ? () => {
+                      stopCamera();
+                      setState("idle");
+                      setGuidance("Camera stopped. Start it again when ready.");
+                    }
+                  : startCamera
+              }
             >
               <span aria-hidden="true">{active ? "■" : "◎"}</span>
               {state === "starting" ? "Starting…" : active ? "Stop camera" : "Start camera"}
@@ -275,9 +429,9 @@ export function ScannerClient() {
       </section>
 
       <section className="scan-tips">
-        <div><span>1</span><p>Turn the sending screen brightness up.</p></div>
-        <div><span>2</span><p>Hold steady enough to keep the full QR visible.</p></div>
-        <div><span>3</span><p>Stay on this page until the checksum reaches 100%.</p></div>
+        <div><span>1</span><p>Use Robust mode first and turn screen brightness up.</p></div>
+        <div><span>2</span><p>Move close enough that the QR nearly fills the guide.</p></div>
+        <div><span>3</span><p>Keep every white margin visible until frames are accepted.</p></div>
       </section>
     </main>
   );
