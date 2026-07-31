@@ -32,7 +32,9 @@ test("server-renders the sender product surface", async () => {
   assert.match(html, /Move a file/);
   assert.match(html, /Choose a file/);
   assert.match(html, /Start QR stream/);
-  assert.match(html, /Loss tolerant/);
+  assert.match(html, /Level-9 compression/);
+  assert.match(html, /4× spatial lanes/);
+  assert.match(html, /Turbo uses four independently recoverable QR lanes/);
   assert.doesNotMatch(html, /codex-preview|loading skeleton/i);
 });
 
@@ -45,5 +47,6 @@ test("server-renders the mobile scanner surface", async () => {
   assert.match(html, /Point\. Hold\. Receive\./);
   assert.match(html, /Start camera/);
   assert.match(html, /File recovery progress/);
-  assert.match(html, /Missed and blurry frames/);
+  assert.match(html, /Useful transfer rate/);
+  assert.match(html, /four parallel Turbo lanes per exposure/);
 });

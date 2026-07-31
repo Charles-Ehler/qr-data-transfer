@@ -1,12 +1,19 @@
-const MAGIC = new Uint8Array([0x51, 0x52, 0x46, 0x32]); // QRF2
-const VERSION = 2;
-const PREFIX = "QRF2:";
-const FIXED_HEADER_BYTES = 40;
-const CRC_BYTES = 4;
+import type { CompressionMode } from "./compression";
+
+const MAGIC = new Uint8Array([0x51, 0x46, 0x33]); // QF3
+const FRAME_TYPE_DESCRIPTOR = 0;
+const FRAME_TYPE_DATA = 1;
 const FLAG_SYSTEMATIC = 1;
+const FLAG_GZIP = 2;
+const DATA_HEADER_BYTES = 21;
+const DESCRIPTOR_HEADER_BYTES = 35;
+const CRC_BYTES = 4;
+const PREFIX = "QF3:";
 const BASE45_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
 
 export const MAX_FILE_BYTES = 512 * 1024 * 1024;
+export const FRAME_PREFIX = PREFIX;
+export const LEGACY_FRAME_PREFIXES = ["QRF1:", "QRF2:"];
 
 export type TransferMeta = {
   sessionId: string;
@@ -14,9 +21,12 @@ export type TransferMeta = {
   filename: string;
   mime: string;
   fileSize: number;
+  transmittedSize: number;
   blockSize: number;
   blockCount: number;
   fileCrc: number;
+  transmittedCrc: number;
+  compression: CompressionMode;
 };
 
 export type TransferSource = {
@@ -35,6 +45,24 @@ export type Droplet = {
   payload: Uint8Array;
 };
 
+export type DescriptorFrame = {
+  kind: "descriptor";
+  meta: TransferMeta;
+};
+
+export type DataFrame = {
+  kind: "data";
+  sessionId: string;
+  sessionBytes: Uint8Array;
+  sequence: number;
+  seed: number;
+  degree: number;
+  systematic: boolean;
+  payload: Uint8Array;
+};
+
+export type TransferFrame = DescriptorFrame | DataFrame;
+
 export type ReceiveResult = {
   accepted: boolean;
   duplicate: boolean;
@@ -50,7 +78,6 @@ type Equation = {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
-
 let crcTable: Uint32Array | undefined;
 
 function getCrcTable() {
@@ -80,7 +107,7 @@ function bytesToHex(bytes: Uint8Array) {
 }
 
 function randomSessionBytes() {
-  const bytes = new Uint8Array(8);
+  const bytes = new Uint8Array(6);
   globalThis.crypto.getRandomValues(bytes);
   return bytes;
 }
@@ -128,7 +155,6 @@ function makeRng(seed: number) {
 
 function robustSolitonCdf(blockCount: number) {
   if (blockCount === 1) return new Float64Array([1]);
-
   const c = 0.12;
   const delta = 0.08;
   const r = c * Math.log(blockCount / delta) * Math.sqrt(blockCount);
@@ -179,8 +205,6 @@ export function indicesForDroplet(
 
   const random = makeRng(seed ^ 0xa5f1523d);
   const selected = new Set<number>();
-
-  // Floyd's algorithm samples without replacement in O(degree).
   for (let cursor = blockCount - degree; cursor < blockCount; cursor += 1) {
     const candidate = random() % (cursor + 1);
     selected.add(selected.has(candidate) ? cursor : candidate);
@@ -195,9 +219,13 @@ export function createTransferSource(
     mime?: string;
     blockSize: number;
     sessionBytes?: Uint8Array;
+    originalSize?: number;
+    originalCrc?: number;
+    compression?: CompressionMode;
   },
 ): TransferSource {
-  if (bytes.byteLength > MAX_FILE_BYTES) {
+  const originalSize = options.originalSize ?? bytes.byteLength;
+  if (originalSize > MAX_FILE_BYTES || bytes.byteLength > MAX_FILE_BYTES) {
     throw new Error("This browser build supports files up to 512 MB.");
   }
   if (!Number.isInteger(options.blockSize) || options.blockSize < 128 || options.blockSize > 1200) {
@@ -205,8 +233,7 @@ export function createTransferSource(
   }
 
   const sessionBytes = options.sessionBytes?.slice() ?? randomSessionBytes();
-  if (sessionBytes.length !== 8) throw new Error("Session IDs must be 8 bytes.");
-
+  if (sessionBytes.length !== 6) throw new Error("Session IDs must be 6 bytes.");
   const filename = truncateFilename(options.filename || "transfer.bin", 48);
   const requestedMime = options.mime || "application/octet-stream";
   const mime =
@@ -228,23 +255,20 @@ export function createTransferSource(
     sessionBytes,
     filename,
     mime,
-    fileSize: bytes.length,
+    fileSize: originalSize,
+    transmittedSize: bytes.length,
     blockSize: options.blockSize,
     blockCount,
-    fileCrc: crc32(bytes),
+    fileCrc: options.originalCrc ?? crc32(bytes),
+    transmittedCrc: crc32(bytes),
+    compression: options.compression ?? "none",
   };
 
-  return {
-    meta,
-    blocks,
-    degreeCdf: robustSolitonCdf(blockCount),
-  };
+  return { meta, blocks, degreeCdf: robustSolitonCdf(blockCount) };
 }
 
 function xorInto(target: Uint8Array, source: Uint8Array) {
-  for (let index = 0; index < target.length; index += 1) {
-    target[index] ^= source[index];
-  }
+  for (let index = 0; index < target.length; index += 1) target[index] ^= source[index];
 }
 
 export function createDroplet(source: TransferSource, sequence: number): Droplet {
@@ -260,16 +284,8 @@ export function createDroplet(source: TransferSource, sequence: number): Droplet
     : mix32(normalizedSequence ^ sessionWord ^ 0x51f15e11);
   const degree = systematic
     ? 1
-    : sampleDegree(
-        source.degreeCdf,
-        makeRng(seed ^ 0xc2b2ae35)() / 0x100000000,
-      );
-  const indices = indicesForDroplet(
-    source.meta.blockCount,
-    degree,
-    seed,
-    systematic,
-  );
+    : sampleDegree(source.degreeCdf, makeRng(seed ^ 0xc2b2ae35)() / 0x100000000);
+  const indices = indicesForDroplet(source.meta.blockCount, degree, seed, systematic);
   const payload = new Uint8Array(source.meta.blockSize);
   for (const index of indices) xorInto(payload, source.blocks[index]);
 
@@ -293,15 +309,10 @@ function bytesToBase45(bytes: Uint8Array) {
       value = Math.floor(value / 45);
       const second = value % 45;
       const third = Math.floor(value / 45);
-      encoded +=
-        BASE45_ALPHABET[first] +
-        BASE45_ALPHABET[second] +
-        BASE45_ALPHABET[third];
+      encoded += BASE45_ALPHABET[first] + BASE45_ALPHABET[second] + BASE45_ALPHABET[third];
     } else {
       const value = bytes[index];
-      encoded +=
-        BASE45_ALPHABET[value % 45] +
-        BASE45_ALPHABET[Math.floor(value / 45)];
+      encoded += BASE45_ALPHABET[value % 45] + BASE45_ALPHABET[Math.floor(value / 45)];
     }
   }
   return encoded;
@@ -311,12 +322,10 @@ function base45ToBytes(value: string) {
   if (value.length % 3 === 1) throw new Error("Invalid Base45 frame length.");
   const output: number[] = [];
   for (let index = 0; index < value.length; ) {
-    const remaining = value.length - index;
-    const groupLength = remaining >= 3 ? 3 : 2;
+    const groupLength = value.length - index >= 3 ? 3 : 2;
     const first = BASE45_ALPHABET.indexOf(value[index]);
     const second = BASE45_ALPHABET.indexOf(value[index + 1]);
     if (first < 0 || second < 0) throw new Error("Invalid Base45 character.");
-
     if (groupLength === 3) {
       const third = BASE45_ALPHABET.indexOf(value[index + 2]);
       if (third < 0) throw new Error("Invalid Base45 character.");
@@ -333,40 +342,39 @@ function base45ToBytes(value: string) {
   return new Uint8Array(output);
 }
 
-export function encodeDroplet(droplet: Droplet) {
-  const nameBytes = textEncoder.encode(droplet.meta.filename);
-  const mimeBytes = textEncoder.encode(droplet.meta.mime);
+function finalizePacket(packet: Uint8Array, payloadEnd: number) {
+  new DataView(packet.buffer).setUint32(payloadEnd, crc32(packet.subarray(0, payloadEnd)), true);
+  return PREFIX + bytesToBase45(packet);
+}
+
+export function encodeDescriptor(sourceOrMeta: TransferSource | TransferMeta) {
+  const meta = "meta" in sourceOrMeta ? sourceOrMeta.meta : sourceOrMeta;
+  const nameBytes = textEncoder.encode(meta.filename);
+  const mimeBytes = textEncoder.encode(meta.mime);
   const packet = new Uint8Array(
-    FIXED_HEADER_BYTES +
-      nameBytes.length +
-      mimeBytes.length +
-      droplet.payload.length +
-      CRC_BYTES,
+    DESCRIPTOR_HEADER_BYTES + nameBytes.length + mimeBytes.length + CRC_BYTES,
   );
   const view = new DataView(packet.buffer);
   let offset = 0;
-
   packet.set(MAGIC, offset);
-  offset += MAGIC.length;
-  view.setUint8(offset, VERSION);
+  offset += 3;
+  view.setUint8(offset, FRAME_TYPE_DESCRIPTOR);
   offset += 1;
-  view.setUint8(offset, droplet.systematic ? FLAG_SYSTEMATIC : 0);
+  view.setUint8(offset, meta.compression === "gzip" ? FLAG_GZIP : 0);
   offset += 1;
-  packet.set(droplet.meta.sessionBytes, offset);
-  offset += 8;
-  view.setUint32(offset, droplet.sequence, true);
+  packet.set(meta.sessionBytes, offset);
+  offset += 6;
+  view.setUint32(offset, meta.fileSize, true);
   offset += 4;
-  view.setUint32(offset, droplet.seed, true);
+  view.setUint32(offset, meta.transmittedSize, true);
   offset += 4;
-  view.setUint32(offset, droplet.meta.fileSize, true);
-  offset += 4;
-  view.setUint16(offset, droplet.meta.blockSize, true);
+  view.setUint16(offset, meta.blockSize, true);
   offset += 2;
-  view.setUint32(offset, droplet.meta.blockCount, true);
+  view.setUint32(offset, meta.blockCount, true);
   offset += 4;
-  view.setUint16(offset, droplet.degree, true);
-  offset += 2;
-  view.setUint32(offset, droplet.meta.fileCrc, true);
+  view.setUint32(offset, meta.fileCrc, true);
+  offset += 4;
+  view.setUint32(offset, meta.transmittedCrc, true);
   offset += 4;
   view.setUint8(offset, nameBytes.length);
   offset += 1;
@@ -376,106 +384,174 @@ export function encodeDroplet(droplet: Droplet) {
   offset += nameBytes.length;
   packet.set(mimeBytes, offset);
   offset += mimeBytes.length;
-  packet.set(droplet.payload, offset);
-  offset += droplet.payload.length;
-  view.setUint32(offset, crc32(packet.subarray(0, offset)), true);
-
-  return PREFIX + bytesToBase45(packet);
+  return finalizePacket(packet, offset);
 }
 
-export function decodeDroplet(value: string): Droplet {
-  if (!value.startsWith(PREFIX)) throw new Error("Not a QRFerry frame.");
+export function encodeDroplet(droplet: Droplet) {
+  const packet = new Uint8Array(DATA_HEADER_BYTES + droplet.payload.length + CRC_BYTES);
+  const view = new DataView(packet.buffer);
+  let offset = 0;
+  packet.set(MAGIC, offset);
+  offset += 3;
+  view.setUint8(offset, FRAME_TYPE_DATA);
+  offset += 1;
+  view.setUint8(offset, droplet.systematic ? FLAG_SYSTEMATIC : 0);
+  offset += 1;
+  packet.set(droplet.meta.sessionBytes, offset);
+  offset += 6;
+  view.setUint32(offset, droplet.sequence, true);
+  offset += 4;
+  view.setUint32(offset, droplet.seed, true);
+  offset += 4;
+  view.setUint16(offset, droplet.degree, true);
+  offset += 2;
+  packet.set(droplet.payload, offset);
+  offset += droplet.payload.length;
+  return finalizePacket(packet, offset);
+}
+
+function decodePacket(value: string) {
+  if (!value.startsWith(PREFIX)) throw new Error("Not a QRFerry v3 frame.");
   const packet = base45ToBytes(value.slice(PREFIX.length));
-  if (packet.length < FIXED_HEADER_BYTES + CRC_BYTES) {
+  if (packet.length < DESCRIPTOR_HEADER_BYTES + CRC_BYTES) {
     throw new Error("Truncated QRFerry frame.");
   }
-
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   const expectedCrc = view.getUint32(packet.length - CRC_BYTES, true);
   const actualCrc = crc32(packet.subarray(0, packet.length - CRC_BYTES));
   if (expectedCrc !== actualCrc) throw new Error("Frame checksum failed.");
-
-  let offset = 0;
   for (let index = 0; index < MAGIC.length; index += 1) {
-    if (packet[offset + index] !== MAGIC[index]) throw new Error("Unknown frame format.");
+    if (packet[index] !== MAGIC[index]) throw new Error("Unknown QRFerry frame format.");
   }
-  offset += MAGIC.length;
+  return { packet, view };
+}
 
-  const version = view.getUint8(offset);
+export function decodeTransferFrame(value: string): TransferFrame {
+  const { packet, view } = decodePacket(value);
+  let offset = MAGIC.length;
+  const type = view.getUint8(offset);
   offset += 1;
-  if (version !== VERSION) throw new Error("Unsupported QRFerry frame version.");
-
   const flags = view.getUint8(offset);
   offset += 1;
-  const sessionBytes = packet.slice(offset, offset + 8);
-  offset += 8;
-  const sequence = view.getUint32(offset, true);
-  offset += 4;
-  const seed = view.getUint32(offset, true);
-  offset += 4;
-  const fileSize = view.getUint32(offset, true);
-  offset += 4;
-  const blockSize = view.getUint16(offset, true);
-  offset += 2;
-  const blockCount = view.getUint32(offset, true);
-  offset += 4;
-  const degree = view.getUint16(offset, true);
-  offset += 2;
-  const fileCrc = view.getUint32(offset, true);
-  offset += 4;
-  const nameLength = view.getUint8(offset);
-  offset += 1;
-  const mimeLength = view.getUint8(offset);
-  offset += 1;
+  const sessionBytes = packet.slice(offset, offset + 6);
+  const sessionId = bytesToHex(sessionBytes);
+  offset += 6;
 
-  const expectedLength =
-    FIXED_HEADER_BYTES + nameLength + mimeLength + blockSize + CRC_BYTES;
-  if (
-    packet.length !== expectedLength ||
-    blockSize < 128 ||
-    blockCount < 1 ||
-    degree < 1 ||
-    degree > blockCount ||
-    fileSize > blockSize * blockCount
-  ) {
-    throw new Error("Invalid QRFerry frame metadata.");
+  if (type === FRAME_TYPE_DESCRIPTOR) {
+    const fileSize = view.getUint32(offset, true);
+    offset += 4;
+    const transmittedSize = view.getUint32(offset, true);
+    offset += 4;
+    const blockSize = view.getUint16(offset, true);
+    offset += 2;
+    const blockCount = view.getUint32(offset, true);
+    offset += 4;
+    const fileCrc = view.getUint32(offset, true);
+    offset += 4;
+    const transmittedCrc = view.getUint32(offset, true);
+    offset += 4;
+    const nameLength = view.getUint8(offset);
+    offset += 1;
+    const mimeLength = view.getUint8(offset);
+    offset += 1;
+    const expectedLength =
+      DESCRIPTOR_HEADER_BYTES + nameLength + mimeLength + CRC_BYTES;
+    if (
+      packet.length !== expectedLength ||
+      blockSize < 128 ||
+      blockSize > 1200 ||
+      blockCount < 1 ||
+      transmittedSize > blockSize * blockCount ||
+      (blockCount > 1 && transmittedSize <= blockSize * (blockCount - 1))
+    ) {
+      throw new Error("Invalid QRFerry descriptor.");
+    }
+    const filename = textDecoder.decode(packet.subarray(offset, offset + nameLength));
+    offset += nameLength;
+    const mime = textDecoder.decode(packet.subarray(offset, offset + mimeLength));
+    return {
+      kind: "descriptor",
+      meta: {
+        sessionId,
+        sessionBytes,
+        filename,
+        mime,
+        fileSize,
+        transmittedSize,
+        blockSize,
+        blockCount,
+        fileCrc,
+        transmittedCrc,
+        compression: (flags & FLAG_GZIP) !== 0 ? "gzip" : "none",
+      },
+    };
   }
 
-  const filename = textDecoder.decode(packet.subarray(offset, offset + nameLength));
-  offset += nameLength;
-  const mime = textDecoder.decode(packet.subarray(offset, offset + mimeLength));
-  offset += mimeLength;
-  const payload = packet.slice(offset, offset + blockSize);
-  const systematic = (flags & FLAG_SYSTEMATIC) !== 0;
-  const meta: TransferMeta = {
-    sessionId: bytesToHex(sessionBytes),
-    sessionBytes,
-    filename,
-    mime,
-    fileSize,
-    blockSize,
-    blockCount,
-    fileCrc,
-  };
+  if (type === FRAME_TYPE_DATA) {
+    const sequence = view.getUint32(offset, true);
+    offset += 4;
+    const seed = view.getUint32(offset, true);
+    offset += 4;
+    const degree = view.getUint16(offset, true);
+    offset += 2;
+    const payloadLength = packet.length - DATA_HEADER_BYTES - CRC_BYTES;
+    if (payloadLength < 128 || payloadLength > 1200 || degree < 1) {
+      throw new Error("Invalid QRFerry data frame.");
+    }
+    return {
+      kind: "data",
+      sessionId,
+      sessionBytes,
+      sequence,
+      seed,
+      degree,
+      systematic: (flags & FLAG_SYSTEMATIC) !== 0,
+      payload: packet.slice(offset, offset + payloadLength),
+    };
+  }
+  throw new Error("Unknown QRFerry frame type.");
+}
 
+export function materializeDroplet(frame: DataFrame, meta: TransferMeta): Droplet {
+  if (
+    frame.sessionId !== meta.sessionId ||
+    frame.payload.length !== meta.blockSize ||
+    frame.degree > meta.blockCount
+  ) {
+    throw new Error("That frame belongs to a different transfer.");
+  }
   return {
     meta,
-    sequence,
-    seed,
-    degree,
-    systematic,
-    indices: indicesForDroplet(blockCount, degree, seed, systematic),
-    payload,
+    sequence: frame.sequence,
+    seed: frame.seed,
+    degree: frame.degree,
+    systematic: frame.systematic,
+    indices: indicesForDroplet(
+      meta.blockCount,
+      frame.degree,
+      frame.seed,
+      frame.systematic,
+    ),
+    payload: frame.payload,
   };
+}
+
+export function decodeDroplet(value: string, meta: TransferMeta) {
+  const frame = decodeTransferFrame(value);
+  if (frame.kind !== "data") throw new Error("Expected a QRFerry data frame.");
+  return materializeDroplet(frame, meta);
 }
 
 function sameTransfer(left: TransferMeta, right: TransferMeta) {
   return (
     left.sessionId === right.sessionId &&
     left.fileSize === right.fileSize &&
+    left.transmittedSize === right.transmittedSize &&
     left.blockSize === right.blockSize &&
     left.blockCount === right.blockCount &&
-    left.fileCrc === right.fileCrc
+    left.fileCrc === right.fileCrc &&
+    left.transmittedCrc === right.transmittedCrc &&
+    left.compression === right.compression
   );
 }
 
@@ -486,6 +562,16 @@ export class FountainDecoder {
   private readonly adjacency = new Map<number, Set<number>>();
   private readonly seenSequences = new Set<number>();
   private nextEquationId = 1;
+
+  initialize(meta: TransferMeta) {
+    if (!this.meta) {
+      this.meta = meta;
+      return;
+    }
+    if (!sameTransfer(this.meta, meta)) {
+      throw new Error("That descriptor belongs to a different transfer.");
+    }
+  }
 
   get solvedCount() {
     return this.solved.size;
@@ -501,6 +587,11 @@ export class FountainDecoder {
 
   get isComplete() {
     return this.totalCount > 0 && this.solvedCount === this.totalCount;
+  }
+
+  receiveData(frame: DataFrame) {
+    if (!this.meta) throw new Error("Waiting for the transfer descriptor.");
+    return this.receive(materializeDroplet(frame, this.meta));
   }
 
   receive(droplet: Droplet): ReceiveResult {
@@ -526,7 +617,6 @@ export class FountainDecoder {
       if (known) xorInto(payload, known);
       else unknown.add(index);
     }
-
     if (unknown.size === 1) {
       this.solve(Array.from(unknown)[0], payload);
     } else if (unknown.size > 1) {
@@ -569,19 +659,16 @@ export class FountainDecoder {
 
   private solve(initialIndex: number, initialPayload: Uint8Array) {
     const queue: Array<[number, Uint8Array]> = [[initialIndex, initialPayload]];
-
     while (queue.length > 0) {
       const [index, payload] = queue.shift()!;
       if (this.solved.has(index)) continue;
       this.solved.set(index, payload);
-
       const linkedIds = Array.from(this.adjacency.get(index) ?? []);
       this.adjacency.delete(index);
       for (const id of linkedIds) {
         const equation = this.equations.get(id);
         if (!equation || !equation.indices.delete(index)) continue;
         xorInto(equation.payload, payload);
-
         if (equation.indices.size === 0) {
           this.removeEquation(id);
         } else if (equation.indices.size === 1) {
@@ -595,18 +682,16 @@ export class FountainDecoder {
   }
 
   result() {
-    if (!this.meta || !this.isComplete) {
-      throw new Error("The transfer is not complete.");
-    }
+    if (!this.meta || !this.isComplete) throw new Error("The transfer is not complete.");
     const output = new Uint8Array(this.meta.blockCount * this.meta.blockSize);
     for (let index = 0; index < this.meta.blockCount; index += 1) {
       const block = this.solved.get(index);
       if (!block) throw new Error("A decoded block is missing.");
       output.set(block, index * this.meta.blockSize);
     }
-    const trimmed = output.slice(0, this.meta.fileSize);
-    if (crc32(trimmed) !== this.meta.fileCrc) {
-      throw new Error("The completed file checksum failed.");
+    const trimmed = output.slice(0, this.meta.transmittedSize);
+    if (crc32(trimmed) !== this.meta.transmittedCrc) {
+      throw new Error("The transmitted stream checksum failed.");
     }
     return trimmed;
   }
@@ -624,5 +709,6 @@ export function formatBytes(bytes: number) {
   return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[unitIndex]}`;
 }
 
-export const FRAME_PREFIX = PREFIX;
-export const LEGACY_FRAME_PREFIX = "QRF1:";
+export function formatRate(bytesPerSecond: number) {
+  return `${formatBytes(Math.max(0, bytesPerSecond))}/s`;
+}
