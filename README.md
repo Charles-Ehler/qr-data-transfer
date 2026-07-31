@@ -18,6 +18,14 @@ dual-lane design with V40-L for a nominal 1.40 Mbps optical payload channel
 before camera loss. Dual modes require fullscreen sender playback, the
 receiver's Dual lane option, and a landscape phone held close and steady.
 
+## Demo
+
+![QRFerry air-gapped data transfer demo](docs/qrferry-demo.webp)
+
+This inline preview is generated from the final privacy-redacted demo. The
+full-resolution recording remains local at
+`videos/qrferrydemo_timed_redacted.mov` and is intentionally excluded from Git.
+
 ## Protocol
 
 - Brotli quality 11 and gzip level 9 are both attempted; only the smallest
