@@ -1,5 +1,3 @@
-import { ThemeSwitch } from "./theme-switch";
-
 const BASE = import.meta.env.BASE_URL ?? "/";
 
 export function AppHeader({ active }: { active: "send" | "scan" }) {
@@ -22,7 +20,10 @@ export function AppHeader({ active }: { active: "send" | "scan" }) {
           Scan
         </a>
       </nav>
-      <ThemeSwitch />
+      <span className="local-badge">
+        <span aria-hidden="true" />
+        Device to device
+      </span>
     </header>
   );
 }

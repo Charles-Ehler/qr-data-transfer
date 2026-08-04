@@ -53,15 +53,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" data-theme="paper">
-      <head>
-        {/* Apply the saved theme before first paint to avoid a flash. */}
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `(function(){try{var t=new URLSearchParams(location.search).get("theme")||localStorage.getItem("airgap-theme");if(t==="paper"||t==="midnight"||t==="terminal"){document.documentElement.dataset.theme=t}}catch(e){}})()`,
-          }}
-        />
-      </head>
+    <html lang="en">
       <body className="antialiased">
         <PwaRegister />
         {children}

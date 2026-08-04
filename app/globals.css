@@ -24,21 +24,16 @@
 }
 
 /* ---------------------------------------------------------------------------
-   Themes.
-
-   Every colour in this stylesheet resolves to one of the tokens below, so a
-   theme is this block of overrides and nothing else. Meaning of the groups:
+   Palette. Every colour in this stylesheet resolves to one of these tokens,
+   so restyling means editing this block and nothing else.
 
      ink / paper / surface-*   page text and light-ish surfaces
      panel-*                   the dark panel that holds the QR stream
      structure                 hard borders and the offset drop shadows
-     signal                    the one accent; always bright enough to carry
-                               dark text (--on-signal) on top of it
+     signal                    the one accent; bright enough to carry dark
+                               text (--on-signal) on top of it
    ------------------------------------------------------------------------- */
-
-/* Paper — the default. Light, editorial, amber accent. */
-:root,
-[data-theme="paper"] {
+:root {
   --ink: #14181d;
   --ink-soft: #3b444c;
   --paper: #f5f2eb;
@@ -75,90 +70,6 @@
   --red-soft: #fff0eb;
   --red-ink: #842f21;
   --ok: #44a766;
-}
-
-/* Midnight — dark, quiet, one cyan accent. */
-[data-theme="midnight"] {
-  --ink: #e7edf3;
-  --ink-soft: #b6c2ce;
-  --paper: #0a0e13;
-  --white: #121923;
-  --surface: #131b25;
-  --surface-2: #101822;
-  --surface-3: #16202b;
-  --surface-4: #18232f;
-  --surface-5: #1d2834;
-  --muted: #94a1ae;
-  --muted-2: #7d8996;
-  --line: #26313f;
-  --line-soft: #202a36;
-  --line-strong: #36434f;
-  --structure: #2c3846;
-  --shadow-flat: #1b242f;
-  --signal: #3ddce6;
-  --signal-soft: #10545c;
-  --on-signal: #06131a;
-  --panel: #070b10;
-  --panel-2: #0d141c;
-  --panel-3: #121a24;
-  --panel-4: #1b242f;
-  --panel-5: #161e28;
-  --panel-line: #24313e;
-  --panel-line-2: #1c2631;
-  --panel-muted: #808c99;
-  --panel-muted-2: #97a4b1;
-  --panel-fg: #eaf3f8;
-  --lens-1: #1a2430;
-  --lens-2: #090f16;
-  --blue: #5d94ff;
-  --red: #f0705a;
-  --red-soft: #2b1512;
-  --red-ink: #ffb9a9;
-  --ok: #3ecf7f;
-}
-
-/* Terminal — black, monospace, phosphor green. */
-[data-theme="terminal"] {
-  --ink: #cbf9d9;
-  --ink-soft: #93d9a7;
-  --paper: #04070a;
-  --white: #07110a;
-  --surface: #08130c;
-  --surface-2: #060f08;
-  --surface-3: #0a170e;
-  --surface-4: #0c1a10;
-  --surface-5: #0f2013;
-  --muted: #74b287;
-  --muted-2: #5f9f72;
-  --line: #18381f;
-  --line-soft: #133019;
-  --line-strong: #205030;
-  --structure: #1f4a2b;
-  --shadow-flat: #102616;
-  --signal: #3bff87;
-  --signal-soft: #0d5a2c;
-  --on-signal: #02170a;
-  --panel: #030806;
-  --panel-2: #06100a;
-  --panel-3: #0a170e;
-  --panel-4: #0f2013;
-  --panel-5: #0b1a0f;
-  --panel-line: #1b3f24;
-  --panel-line-2: #14311c;
-  --panel-muted: #67a879;
-  --panel-muted-2: #80bf90;
-  --panel-fg: #d9ffe6;
-  --lens-1: #0c1e12;
-  --lens-2: #040906;
-  --blue: #4dd2ff;
-  --red: #ff6f5d;
-  --red-soft: #250f0c;
-  --red-ink: #ffb5aa;
-  --ok: #3bff87;
-}
-
-[data-theme="terminal"] {
-  --font-body: var(--font-geist-mono), ui-monospace, monospace;
 }
 
 * {
@@ -1531,46 +1442,6 @@ input:focus-visible {
   }
 }
 
-/* Temporary appearance picker (removed once a look is chosen). */
-.theme-switch {
-  justify-self: end;
-  display: inline-flex;
-  gap: 4px;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--surface) 55%, transparent);
-}
-
-.theme-switch button {
-  padding: 7px 13px;
-  border: 0;
-  border-radius: 999px;
-  color: var(--muted);
-  background: transparent;
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition: background 160ms ease, color 160ms ease;
-}
-
-.theme-switch button:hover {
-  color: var(--ink);
-}
-
-.theme-switch button.active {
-  color: var(--on-signal);
-  background: var(--signal);
-}
-
-@media (max-width: 900px) {
-  .theme-switch {
-    display: none;
-  }
-}
 
 .site-footer {
   width: min(1280px, calc(100% - 64px));
