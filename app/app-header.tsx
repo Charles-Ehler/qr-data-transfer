@@ -1,9 +1,9 @@
-import Link from "next/link";
+const BASE = import.meta.env.BASE_URL ?? "/";
 
 export function AppHeader({ active }: { active: "send" | "scan" }) {
   return (
     <header className="site-header">
-      <Link className="wordmark" href="/" aria-label="QRFerry home">
+      <a className="wordmark" href={BASE} aria-label="QRFerry home">
         <span className="brand-mark" aria-hidden="true">
           <i />
           <i />
@@ -11,14 +11,14 @@ export function AppHeader({ active }: { active: "send" | "scan" }) {
           <i />
         </span>
         <span>QRFerry</span>
-      </Link>
+      </a>
       <nav className="mode-switch" aria-label="Transfer mode">
-        <Link className={active === "send" ? "active" : ""} href="/">
+        <a className={active === "send" ? "active" : ""} href={BASE}>
           Send
-        </Link>
-        <Link className={active === "scan" ? "active" : ""} href="/scan">
+        </a>
+        <a className={active === "scan" ? "active" : ""} href={`${BASE}scan`}>
           Scan
-        </Link>
+        </a>
       </nav>
       <span className="local-badge">
         <span aria-hidden="true" />

@@ -283,7 +283,10 @@ export function SendClient() {
 
   const scanUrl = useMemo(() => {
     if (typeof window === "undefined") return "/scan";
-    return `${window.location.origin}/scan`;
+    return new URL(
+      `${import.meta.env.BASE_URL ?? "/"}scan/`,
+      window.location.href,
+    ).toString();
   }, []);
 
   const copyScanLink = async () => {
