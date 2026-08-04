@@ -207,7 +207,7 @@ export function ScannerClient() {
       } catch {
         const textPrefix = new TextDecoder().decode(bytes.subarray(0, 8));
         if (textPrefix.startsWith("QF2") || textPrefix.startsWith("QF3")) {
-          setGuidance("An older QRFerry sender is visible. Reload the sending screen.");
+          setGuidance("An older Airgap sender is visible. Reload the sending screen.");
           return;
         }
         setBadFrames((current) => current + 1);
@@ -693,7 +693,7 @@ export function ScannerClient() {
               {state === "receiving"
                 ? "Receiving RaptorQ symbols"
                 : state === "scanning"
-                  ? "Looking for QRFerry"
+                  ? "Looking for Airgap"
                   : complete
                     ? "Transfer verified"
                     : "Ready to scan"}

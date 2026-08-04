@@ -230,7 +230,7 @@ export function parseOpticalFrame(frame: Uint8Array): OpticalFrame {
   }
   for (let index = 0; index < FRAME_MAGIC.length; index += 1) {
     if (frame[index] !== FRAME_MAGIC[index]) {
-      throw new Error("This is not a QRFerry v4 optical frame.");
+      throw new Error("This is not a Airgap v4 optical frame.");
     }
   }
   if (frame[18] !== 1) throw new Error("Unsupported optical frame revision.");

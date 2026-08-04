@@ -411,17 +411,17 @@ export function encodeDroplet(droplet: Droplet) {
 }
 
 function decodePacket(value: string) {
-  if (!value.startsWith(PREFIX)) throw new Error("Not a QRFerry v3 frame.");
+  if (!value.startsWith(PREFIX)) throw new Error("Not a Airgap v3 frame.");
   const packet = base45ToBytes(value.slice(PREFIX.length));
   if (packet.length < DESCRIPTOR_HEADER_BYTES + CRC_BYTES) {
-    throw new Error("Truncated QRFerry frame.");
+    throw new Error("Truncated Airgap frame.");
   }
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   const expectedCrc = view.getUint32(packet.length - CRC_BYTES, true);
   const actualCrc = crc32(packet.subarray(0, packet.length - CRC_BYTES));
   if (expectedCrc !== actualCrc) throw new Error("Frame checksum failed.");
   for (let index = 0; index < MAGIC.length; index += 1) {
-    if (packet[index] !== MAGIC[index]) throw new Error("Unknown QRFerry frame format.");
+    if (packet[index] !== MAGIC[index]) throw new Error("Unknown Airgap frame format.");
   }
   return { packet, view };
 }
@@ -464,7 +464,7 @@ export function decodeTransferFrame(value: string): TransferFrame {
       transmittedSize > blockSize * blockCount ||
       (blockCount > 1 && transmittedSize <= blockSize * (blockCount - 1))
     ) {
-      throw new Error("Invalid QRFerry descriptor.");
+      throw new Error("Invalid Airgap descriptor.");
     }
     const filename = textDecoder.decode(packet.subarray(offset, offset + nameLength));
     offset += nameLength;
@@ -496,7 +496,7 @@ export function decodeTransferFrame(value: string): TransferFrame {
     offset += 2;
     const payloadLength = packet.length - DATA_HEADER_BYTES - CRC_BYTES;
     if (payloadLength < 128 || payloadLength > 1200 || degree < 1) {
-      throw new Error("Invalid QRFerry data frame.");
+      throw new Error("Invalid Airgap data frame.");
     }
     return {
       kind: "data",
@@ -509,7 +509,7 @@ export function decodeTransferFrame(value: string): TransferFrame {
       payload: packet.slice(offset, offset + payloadLength),
     };
   }
-  throw new Error("Unknown QRFerry frame type.");
+  throw new Error("Unknown Airgap frame type.");
 }
 
 export function materializeDroplet(frame: DataFrame, meta: TransferMeta): Droplet {
@@ -538,7 +538,7 @@ export function materializeDroplet(frame: DataFrame, meta: TransferMeta): Drople
 
 export function decodeDroplet(value: string, meta: TransferMeta) {
   const frame = decodeTransferFrame(value);
-  if (frame.kind !== "data") throw new Error("Expected a QRFerry data frame.");
+  if (frame.kind !== "data") throw new Error("Expected a Airgap data frame.");
   return materializeDroplet(frame, meta);
 }
 

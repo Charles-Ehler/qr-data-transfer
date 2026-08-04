@@ -347,7 +347,7 @@ export function SendClient() {
         </div>
         <div className="hero-copy">
           <p>
-            Your file stays on your devices. QRFerry compresses it, then sends
+            Your file stays on your devices. Airgap compresses it, then sends
             raw binary through a loss-tolerant RaptorQ stream.
           </p>
           <div className="trust-row">

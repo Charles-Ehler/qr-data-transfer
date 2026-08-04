@@ -4,8 +4,8 @@ const BASE = import.meta.env.BASE_URL ?? "/";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "QRFerry · Camera file transfer",
-    short_name: "QRFerry",
+    name: "Airgap · Camera file transfer",
+    short_name: "Airgap",
     description:
       "Send and receive files as loss-tolerant animated QR streams.",
     start_url: `${BASE}scan/`,
